@@ -29,8 +29,8 @@ enum class GameStep(
         recommendedTool = ToolType.NAIL_GRINDER
     ),
     APPLY_CREAM(
-        title = "Fix the toes: Apply soothing cream",
-        subtitle = "Rub lotion over the foot until it glows",
+        title = "Fix the toes: Apply soothing mask",
+        subtitle = "Apply orange mask, let it dry, then peel it off!",
         recommendedTool = ToolType.CREAM_TUBE
     ),
     COMPLETED(
