@@ -11,6 +11,7 @@ import android.graphics.Paint
 import android.graphics.Path
 import android.graphics.PointF
 import android.graphics.PorterDuff
+import android.graphics.PorterDuffColorFilter
 import android.graphics.PorterDuffXfermode
 import android.graphics.RadialGradient
 import android.graphics.RectF
@@ -37,12 +38,13 @@ class MakeoverView @JvmOverloads constructor(
     // --- Game State ---
     var currentStep: GameStep = GameStep.CLEAN_DIRT
         private set
-    var activeTool: ToolType = ToolType.WET_WIPE
+    var activeTool: ToolType? = ToolType.WET_WIPE
 
     // Listeners for UI updates
     var onStepProgressChanged: ((GameStep, Float) -> Unit)? = null
     var onStepCompletedListener: ((GameStep) -> Unit)? = null
     var onLevelCompletedListener: (() -> Unit)? = null
+    var onToolDeselectRequested: (() -> Unit)? = null
 
     // --- Layers ---
     private var dirtBitmap: Bitmap? = null
@@ -64,6 +66,10 @@ class MakeoverView @JvmOverloads constructor(
     private var maskState = MaskState.APPLYING
     private var maskDryProgress = 0f
     private var maskPeelProgress = 0f
+
+    // Cool finishing animation state
+    private var finishAnimProgress = 0f
+    private var isFinishing = false
 
     // Foot base geometry
     private val footPath = Path()
@@ -463,6 +469,20 @@ class MakeoverView @JvmOverloads constructor(
                 val alphaInt = (creamFadeAlpha * 255).toInt().coerceIn(0, 255)
                 layerAlphaPaint.alpha = alphaInt
 
+                // Dynamic Color Filter when drying/dried:
+                // Smoothly transforms wet bright golden gel into a deep, dried amber-bronze peelable film
+                if (maskDryProgress > 0f) {
+                    val tintColor = Color.argb(
+                        (maskDryProgress * 155).toInt(),
+                        216,
+                        67,
+                        21
+                    )
+                    layerAlphaPaint.colorFilter = PorterDuffColorFilter(tintColor, PorterDuff.Mode.SRC_ATOP)
+                } else {
+                    layerAlphaPaint.colorFilter = null
+                }
+
                 if (maskState == MaskState.PEELABLE && maskPeelProgress > 0f) {
                     canvas.save()
                     // Mask peels from toes (top in foot space) down towards heel (bottom in foot space)
@@ -475,6 +495,8 @@ class MakeoverView @JvmOverloads constructor(
                 } else {
                     canvas.drawBitmap(bmp, 0f, 0f, layerAlphaPaint)
                 }
+
+                layerAlphaPaint.colorFilter = null
             }
         }
 
@@ -490,7 +512,43 @@ class MakeoverView @JvmOverloads constructor(
 
         // Floating peel prompt when mask is dry and ready to peel
         if (maskState == MaskState.PEELABLE && currentStep == GameStep.APPLY_CREAM) {
-            canvas.drawText("⬆ Drag Up to Peel Off Mask! ⬆", cx, footBounds.bottom + 45f, promptPaint)
+            canvas.drawText("✨ Mask is dry! Deselect tool & drag up to peel! ✨", cx, footBounds.bottom + 45f, promptPaint)
+        }
+
+        // Cool Finishing Shockwave Glow Rings & Victory Banner
+        if (finishAnimProgress > 0f) {
+            val maxR = hypot(width.toFloat(), height.toFloat()) * 0.55f
+            for (ring in 0..2) {
+                val ringProg = (finishAnimProgress * 1.4f - ring * 0.22f).coerceIn(0f, 1f)
+                if (ringProg > 0f && ringProg < 1f) {
+                    val ringRadius = maxR * ringProg
+                    val ringAlpha = ((1f - ringProg) * 200).toInt()
+                    val ringPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                        style = Paint.Style.STROKE
+                        strokeWidth = 14f * (1f - ringProg)
+                        color = Color.argb(ringAlpha, 255, 215, 0)
+                    }
+                    canvas.drawCircle(cx, cy, ringRadius, ringPaint)
+                }
+            }
+
+            if (finishAnimProgress in 0.15f..0.95f) {
+                val bannerAlpha = if (finishAnimProgress < 0.45f) {
+                    ((finishAnimProgress - 0.15f) / 0.3f * 255).toInt()
+                } else {
+                    ((0.95f - finishAnimProgress) / 0.5f * 255).toInt()
+                }.coerceIn(0, 255)
+
+                val victoryTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                    color = Color.parseColor("#E65100")
+                    alpha = bannerAlpha
+                    textSize = 38f
+                    textAlign = Paint.Align.CENTER
+                    isFakeBoldText = true
+                    setShadowLayer(14f, 0f, 4f, Color.argb(bannerAlpha, 255, 238, 88))
+                }
+                canvas.drawText("✨ PERFECT RESTORATION! ✨", cx, footBounds.centerY() + 15f, victoryTextPaint)
+            }
         }
 
         // 8. Draw Active Dragged Tool (follows touch naturally in screen space)
@@ -631,17 +689,29 @@ class MakeoverView @JvmOverloads constructor(
             val remain = 1f - nail.trimProgress
             if (remain <= 0.01f) continue // fully trimmed!
 
-            val sprite = nailSprites.getOrNull(idx)
+            // Correctly map damaged nail sprites to specific toes:
+            // [0]: Big toe, [1]: Index toe, [2]: Middle toe, [4]: Ring toe, [5]: Pinky toe
+            val spriteIndex = when (idx) {
+                0 -> 0 // Big Toe
+                1 -> 1 // Index Toe
+                2 -> 2 // Middle Toe
+                3 -> 4 // Ring Toe
+                4 -> 5 // Pinky Toe
+                else -> idx
+            }
+            val sprite = nailSprites.getOrNull(spriteIndex)
+
             if (sprite != null) {
                 canvas.save()
                 canvas.rotate(nail.rotationDeg, nail.x, nail.y)
-                val nw = nail.radiusX * 2.2f
+                val nw = nail.radiusX * 2.05f
                 val nh = nw * (sprite.height.toFloat() / sprite.width.toFloat()) * remain
+                val nailCenterY = nail.y - nail.radiusY * 0.30f
                 val nailRect = RectF(
                     nail.x - nw * 0.5f,
-                    nail.y - nh * 0.55f,
+                    nailCenterY - nh * 0.5f,
                     nail.x + nw * 0.5f,
-                    nail.y + nh * 0.45f
+                    nailCenterY + nh * 0.5f
                 )
                 layerAlphaPaint.alpha = (remain * 255).toInt().coerceIn(0, 255)
                 canvas.drawBitmap(sprite, null, nailRect, layerAlphaPaint)
@@ -811,12 +881,14 @@ class MakeoverView @JvmOverloads constructor(
     // --- Tool Drawing on Canvas ---
 
     private fun drawActiveTool(canvas: Canvas, x: Float, y: Float) {
+        val tool = activeTool ?: return
+
         canvas.save()
         // Tilt tool naturally for pleasant tactile perspective
         val toolAngle = -22f
         canvas.rotate(toolAngle, x, y)
 
-        val sprite = when (activeTool) {
+        val sprite = when (tool) {
             ToolType.NAIL_GRINDER -> SpriteManager.toolGrinder
             ToolType.WET_WIPE -> SpriteManager.toolWipes
             ToolType.TWEEZERS -> SpriteManager.toolTweezers
@@ -836,7 +908,7 @@ class MakeoverView @JvmOverloads constructor(
             canvas.drawBitmap(sprite, null, shadowRect, toolShadowPaint)
             canvas.drawBitmap(sprite, null, destRect, null)
         } else {
-            when (activeTool) {
+            when (tool) {
                 ToolType.WET_WIPE -> drawWetWipeTool(canvas, x, y)
                 ToolType.TWEEZERS -> drawTweezersTool(canvas, x, y)
                 ToolType.NAIL_GRINDER -> drawNailGrinderTool(canvas, x, y)
@@ -1134,6 +1206,9 @@ class MakeoverView @JvmOverloads constructor(
             ToolType.NAIL_GRINDER -> {
                 grindNailAt(footX, footY, screenX, screenY)
             }
+            null -> {
+                // Bare finger touch
+            }
         }
     }
 
@@ -1195,6 +1270,9 @@ class MakeoverView @JvmOverloads constructor(
             }
             ToolType.CREAM_TUBE -> {
                 applyCreamAt(prevFootX, prevFootY, currFootX, currFootY)
+            }
+            null -> {
+                // Bare finger drag
             }
         }
     }
@@ -1300,8 +1378,9 @@ class MakeoverView @JvmOverloads constructor(
         for (nail in nails) {
             if (nail.trimProgress >= 1f) continue
 
-            val dist = hypot(footX - nail.x, footY - nail.y)
-            if (dist < nail.radiusX * 1.6f + 15f) {
+            val nailCenterY = nail.y - nail.radiusY * 0.30f
+            val dist = hypot(footX - nail.x, footY - nailCenterY)
+            if (dist < nail.radiusX * 1.6f + 25f) {
                 nail.trimProgress = (nail.trimProgress + 0.035f).coerceAtMost(1f)
 
                 soundManager.playGrindSound()
@@ -1393,12 +1472,13 @@ class MakeoverView @JvmOverloads constructor(
         soundManager.playChime()
         soundManager.vibrateTick(120)
 
+        // 1.8-second drying animation during which color visibly changes from wet gold to dried amber-bronze
         val animator = ValueAnimator.ofFloat(0f, 1f).apply {
-            duration = 1100
+            duration = 1800
             interpolator = AccelerateDecelerateInterpolator()
             addUpdateListener { va ->
                 maskDryProgress = va.animatedValue as Float
-                if (Random.nextFloat() < 0.4f) {
+                if (Random.nextFloat() < 0.45f) {
                     val rx = footBounds.left + Random.nextFloat() * footBounds.width()
                     val ry = footBounds.top + Random.nextFloat() * footBounds.height()
                     spawnSparkles(rx, ry, 2, Color.parseColor("#FFE082"))
@@ -1408,6 +1488,9 @@ class MakeoverView @JvmOverloads constructor(
             addListener(object : android.animation.AnimatorListenerAdapter() {
                 override fun onAnimationEnd(animation: android.animation.Animator) {
                     maskState = MaskState.PEELABLE
+                    // Deselect the tube so user's bare hand is ready to peel
+                    selectTool(null)
+                    onToolDeselectRequested?.invoke()
                     soundManager.playChime()
                     soundManager.vibrateSuccess()
                     onStepProgressChanged?.invoke(GameStep.APPLY_CREAM, 0.7f)
@@ -1420,30 +1503,45 @@ class MakeoverView @JvmOverloads constructor(
 
     private fun absorbCreamIntoSparkles() {
         creamAbsorbed = true
+        isFinishing = true
         soundManager.playVictory()
         soundManager.vibrateSuccess()
 
-        // Fade cream layer into radiant skin
-        val animator = ValueAnimator.ofFloat(1f, 0f).apply {
-            duration = 750
+        val cx = footBounds.centerX()
+        val cy = footBounds.centerY()
+
+        // 1. Confetti celebration
+        spawnConfetti()
+
+        // 2. Star sparkles burst on every newly restored toe
+        for (nail in nails) {
+            val screenNailX = 2f * cx - nail.x
+            val screenNailY = 2f * cy - (nail.y - nail.radiusY * 0.30f)
+            spawnSparkles(screenNailX, screenNailY, 16, Color.parseColor("#FFD700"))
+        }
+
+        // 3. Shockwave glow rings and radiant finish animation over 2 seconds
+        val animator = ValueAnimator.ofFloat(0f, 1f).apply {
+            duration = 2000
             interpolator = AccelerateDecelerateInterpolator()
             addUpdateListener { va ->
-                creamFadeAlpha = va.animatedValue as Float
-                if (Random.nextFloat() < 0.6f) {
+                finishAnimProgress = va.animatedValue as Float
+                creamFadeAlpha = 1f - finishAnimProgress.coerceIn(0f, 1f)
+                if (Random.nextFloat() < 0.75f) {
                     val rx = footBounds.left + Random.nextFloat() * footBounds.width()
                     val ry = footBounds.top + Random.nextFloat() * footBounds.height()
-                    spawnSparkles(rx, ry, 3, Color.parseColor("#FFF9C4"))
+                    spawnSparkles(rx, ry, 4, Color.parseColor("#FFF9C4"))
                 }
                 invalidate()
             }
+            addListener(object : android.animation.AnimatorListenerAdapter() {
+                override fun onAnimationEnd(animation: android.animation.Animator) {
+                    advanceStep(GameStep.COMPLETED)
+                    onLevelCompletedListener?.invoke()
+                }
+            })
         }
         animator.start()
-
-        // Confetti celebration
-        spawnConfetti()
-
-        advanceStep(GameStep.COMPLETED)
-        onLevelCompletedListener?.invoke()
     }
 
     // --- Particle Spawners ---
@@ -1506,7 +1604,7 @@ class MakeoverView @JvmOverloads constructor(
         activeTool = next.recommendedTool
     }
 
-    fun selectTool(tool: ToolType) {
+    fun selectTool(tool: ToolType?) {
         activeTool = tool
         soundManager.vibrateTick(70)
         invalidate()
@@ -1545,6 +1643,8 @@ class MakeoverView @JvmOverloads constructor(
         maskState = MaskState.APPLYING
         maskDryProgress = 0f
         maskPeelProgress = 0f
+        finishAnimProgress = 0f
+        isFinishing = false
 
         for (nail in nails) {
             nail.trimProgress = 0f

@@ -77,7 +77,7 @@ fun MakeoverGameScreen(
     // --- State ---
     var makeoverViewRef by remember { mutableStateOf<MakeoverView?>(null) }
     var currentStep by remember { mutableStateOf(GameStep.CLEAN_DIRT) }
-    var activeTool by remember { mutableStateOf(ToolType.WET_WIPE) }
+    var activeTool by remember { mutableStateOf<ToolType?>(ToolType.WET_WIPE) }
     var stepProgress by remember { mutableFloatStateOf(0f) }
 
     // Live countdown timer starting at 220 seconds
@@ -170,6 +170,9 @@ fun MakeoverGameScreen(
                                 activeTool = this.activeTool
                                 stepProgress = 0f
                             }
+                            onToolDeselectRequested = {
+                                activeTool = null
+                            }
                             onLevelCompletedListener = {
                                 isLevelComplete = true
                                 isTimerRunning = false
@@ -190,8 +193,14 @@ fun MakeoverGameScreen(
                 isHintActive = isHintActive,
                 hintScale = hintScale,
                 onSelectTool = { tool ->
-                    activeTool = tool
-                    makeoverViewRef?.selectTool(tool)
+                    if (activeTool == tool) {
+                        // Selecting it again deselects it!
+                        activeTool = null
+                        makeoverViewRef?.selectTool(null)
+                    } else {
+                        activeTool = tool
+                        makeoverViewRef?.selectTool(tool)
+                    }
                     if (isHintActive) isHintActive = false
                 }
             )
@@ -435,7 +444,7 @@ fun TopHeaderSection(
 
 @Composable
 fun ToolTray(
-    selectedTool: ToolType,
+    selectedTool: ToolType?,
     recommendedTool: ToolType,
     isHintActive: Boolean,
     hintScale: Float,
