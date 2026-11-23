@@ -200,11 +200,24 @@ class MakeoverView @JvmOverloads constructor(
     }
 
     private fun buildFootGeometry(w: Float, h: Float) {
-        // Center the foot nicely in the canvas
+        // Center the foot nicely in the canvas and zoom to fill the viewport
         val centerX = w * 0.5f
-        val centerY = h * 0.48f
-        val footWidth = minOf(w * 0.72f, 440f)
-        val footHeight = footWidth * 1.72f
+        val centerY = h * 0.47f
+
+        // Zoom to fill ~88% of canvas width or ~90% of canvas height
+        val targetWidth = w * 0.88f
+        val maxHeight = h * 0.90f
+        val aspect = 1.82f
+
+        val footWidth: Float
+        val footHeight: Float
+        if (targetWidth * aspect <= maxHeight) {
+            footWidth = targetWidth
+            footHeight = targetWidth * aspect
+        } else {
+            footHeight = maxHeight
+            footWidth = maxHeight / aspect
+        }
 
         footBounds.set(
             centerX - footWidth * 0.5f,
@@ -212,6 +225,11 @@ class MakeoverView @JvmOverloads constructor(
             centerX + footWidth * 0.5f,
             centerY + footHeight * 0.5f
         )
+
+        // Scale interactive tool brush widths dynamically with foot zoom
+        erasePaint.strokeWidth = footWidth * 0.22f
+        creamDepositPaint.strokeWidth = footWidth * 0.20f
+        creamHighlightPaint.strokeWidth = footWidth * 0.08f
 
         footPath.reset()
         // Top view of a stylized right foot with spread toes
@@ -261,20 +279,20 @@ class MakeoverView @JvmOverloads constructor(
             Shader.TileMode.CLAMP
         )
 
-        // Generate 5 Toes with precise nail beds and coordinates aligned to foot sprite
+        // Generate 5 Toes with dynamically scaled nail beds matching zoomed foot
         nails.clear()
         val toeBaseY = top
         val toeConfigs = listOf(
             // Big toe (Index 0, Left)
-            ToeConfig("Big Toe", left + footWidth * 0.17f, toeBaseY - footHeight * 0.10f, 38f, 48f, -7f),
+            ToeConfig("Big Toe", left + footWidth * 0.17f, toeBaseY - footHeight * 0.10f, footWidth * 0.095f, footHeight * 0.070f, -7f),
             // Index toe
-            ToeConfig("Index Toe", left + footWidth * 0.36f, toeBaseY - footHeight * 0.10f, 30f, 40f, -3f),
+            ToeConfig("Index Toe", left + footWidth * 0.36f, toeBaseY - footHeight * 0.10f, footWidth * 0.075f, footHeight * 0.060f, -3f),
             // Middle toe
-            ToeConfig("Middle Toe", left + footWidth * 0.53f, toeBaseY - footHeight * 0.09f, 28f, 38f, 2f),
+            ToeConfig("Middle Toe", left + footWidth * 0.53f, toeBaseY - footHeight * 0.09f, footWidth * 0.070f, footHeight * 0.056f, 2f),
             // Ring toe
-            ToeConfig("Ring Toe", left + footWidth * 0.69f, toeBaseY - footHeight * 0.07f, 26f, 35f, 6f),
+            ToeConfig("Ring Toe", left + footWidth * 0.69f, toeBaseY - footHeight * 0.07f, footWidth * 0.065f, footHeight * 0.052f, 6f),
             // Pinky toe
-            ToeConfig("Pinky Toe", left + footWidth * 0.85f, toeBaseY - footHeight * 0.04f, 22f, 30f, 10f)
+            ToeConfig("Pinky Toe", left + footWidth * 0.85f, toeBaseY - footHeight * 0.04f, footWidth * 0.055f, footHeight * 0.045f, 10f)
         )
 
         for ((idx, cfg) in toeConfigs.withIndex()) {
@@ -292,7 +310,8 @@ class MakeoverView @JvmOverloads constructor(
             )
         }
 
-        // Setup 3 splinters for the Tweezers step
+        // Setup 3 splinters scaled with zoomed foot
+        val sLen = footHeight * 0.055f
         splinters.clear()
         splinters.add(
             Splinter(
@@ -300,7 +319,7 @@ class MakeoverView @JvmOverloads constructor(
                 x = left + footWidth * 0.28f,
                 y = footBounds.centerY() - footHeight * 0.12f,
                 angleDeg = 35f,
-                length = 42f
+                length = sLen
             )
         )
         splinters.add(
@@ -309,7 +328,7 @@ class MakeoverView @JvmOverloads constructor(
                 x = footBounds.centerX() + footWidth * 0.12f,
                 y = footBounds.centerY() + footHeight * 0.08f,
                 angleDeg = -45f,
-                length = 38f
+                length = sLen * 0.9f
             )
         )
         splinters.add(
@@ -318,13 +337,13 @@ class MakeoverView @JvmOverloads constructor(
                 x = left + footWidth * 0.22f,
                 y = footBounds.bottom - footHeight * 0.22f,
                 angleDeg = 70f,
-                length = 45f
+                length = sLen * 1.05f
             )
         )
 
-        // Setup sample points for dirt cleaning progress
+        // Setup sample points for dirt cleaning progress scaled with foot
         dirtSamplePoints.clear()
-        val gridStep = 28f
+        val gridStep = footWidth * 0.065f
         var sx = footBounds.left
         while (sx <= footBounds.right) {
             var sy = footBounds.top - footHeight * 0.12f
@@ -805,7 +824,7 @@ class MakeoverView @JvmOverloads constructor(
         }
 
         if (sprite != null) {
-            val toolW = 145f
+            val toolW = maxOf(footBounds.width() * 0.26f, 150f)
             val toolH = toolW * (sprite.height.toFloat() / sprite.width.toFloat())
             val destRect = RectF(
                 x - toolW * 0.45f,
