@@ -3,47 +3,86 @@ package com.example.asmrgame
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.Canvas
 import android.graphics.Color
-import java.util.ArrayDeque
-import kotlin.math.abs
+import android.graphics.Matrix
+import android.graphics.Paint
+import android.graphics.PorterDuff
+import android.graphics.PorterDuffXfermode
+import android.graphics.RadialGradient
+import android.graphics.Rect
+import android.graphics.RectF
+import android.graphics.Shader
 
 /**
- * Loads the game asset sprite sheet and extracts individual transparent sprites.
+ * Loads the transparent PNG game assets from res/drawable-nodpi and registers
+ * all foot states, damaged nails, mud layers, and tools into a shared coordinate space.
  */
 object SpriteManager {
 
     var isLoaded = false
         private set
 
+    // Playfield & Foot sprites (all cropped to exact visible foot silhouette bounds)
+    var treatmentMat: Bitmap? = null
+        private set
     var cleanFoot: Bitmap? = null
         private set
-    var hairOverlay: Bitmap? = null
+    var dirtyFoot: Bitmap? = null
         private set
-    var dirtOverlay: Bitmap? = null
+    var dirtOnlyFoot: Bitmap? = null
         private set
-    var dirtStains: Bitmap? = null
+    var creamFullFoot: Bitmap? = null
         private set
-
-    var overgrownNails = mutableListOf<Bitmap>()
+    var peelFrame1: Bitmap? = null
         private set
-
-    var toolGrinder: Bitmap? = null
+    var peelFrame2: Bitmap? = null
         private set
-    var toolWipes: Bitmap? = null
+    var peelFrame3: Bitmap? = null
         private set
-    var toolTweezers: Bitmap? = null
-        private set
-    var toolCream: Bitmap? = null
+    var cleanHappyFoot: Bitmap? = null
         private set
 
-    var bannerSign: Bitmap? = null
+    // 5 individual damaged nails extracted directly from foot_dirty at FootAnchors.NAILS
+    val damagedNails = mutableListOf<Bitmap?>()
+
+    // Tray tool icons (306x360)
+    var toolTrayGrinder: Bitmap? = null
         private set
-    var btnBack: Bitmap? = null
+    var toolTrayWipes: Bitmap? = null
         private set
-    var btnHint: Bitmap? = null
+    var toolTrayTweezers: Bitmap? = null
         private set
-    var btnAddTime: Bitmap? = null
+    var toolTrayCream: Bitmap? = null
         private set
+
+    // In-use draggable 3D tools (1024x1024)
+    var toolUseGrinder: Bitmap? = null
+        private set
+    var toolUseWipes: Bitmap? = null
+        private set
+    var toolUseTweezers: Bitmap? = null
+        private set
+    var toolUseCreamOpen: Bitmap? = null
+        private set
+    var toolUseCreamApplying: Bitmap? = null
+        private set
+
+    // Effects & Reactions
+    var fxCreamSparkle: Bitmap? = null
+        private set
+    var fxGoldenSparkle: Bitmap? = null
+        private set
+    var fxSoapBubble: Bitmap? = null
+        private set
+    var fxHappyReaction: Bitmap? = null
+        private set
+    var fxCreamFilmPeelOff: Bitmap? = null
+        private set
+
+    // Exact visible foot bounding boxes verified against the PNG assets
+    private val FOOT_VISIBLE_516X915 = Rect(8, 8, 508, 907)
+    private val PEEL_FOOT_VISIBLE_1024 = Rect(274, 87, 749, 937)
 
     fun load(context: Context) {
         if (isLoaded) return
@@ -51,267 +90,141 @@ object SpriteManager {
         try {
             val opts = BitmapFactory.Options().apply {
                 inPreferredConfig = Bitmap.Config.ARGB_8888
-                inMutable = true
+                inScaled = false
             }
-            val rawSheet = BitmapFactory.decodeResource(context.resources, R.drawable.game_sheet, opts)
-                ?: return
 
-            // Make background checkerboard transparent using flood fill from outer edges
-            val sheet = makeCheckerboardTransparent(rawSheet)
-
-            // 1. Top Row: Foot, Hair, Dirt
-            cleanFoot = cropRelative(sheet, 0.035f, 0.015f, 0.335f, 0.405f)
-            hairOverlay = cropRelative(sheet, 0.365f, 0.015f, 0.665f, 0.405f)
-            dirtOverlay = cropRelative(sheet, 0.695f, 0.015f, 0.985f, 0.405f)
-
-            // 2. Second Row: Overgrown Nails (6 toes)
-            overgrownNails.clear()
-            overgrownNails.add(cropRelative(sheet, 0.055f, 0.425f, 0.235f, 0.555f)) // Big toe left
-            overgrownNails.add(cropRelative(sheet, 0.235f, 0.445f, 0.355f, 0.535f)) // Toe 2
-            overgrownNails.add(cropRelative(sheet, 0.355f, 0.455f, 0.455f, 0.540f)) // Toe 3
-            overgrownNails.add(cropRelative(sheet, 0.485f, 0.425f, 0.665f, 0.560f)) // Big toe split
-            overgrownNails.add(cropRelative(sheet, 0.685f, 0.435f, 0.810f, 0.540f)) // Toe 5 cracked
-            overgrownNails.add(cropRelative(sheet, 0.825f, 0.450f, 0.935f, 0.540f)) // Toe 6 small
-
-            // 3. Third Row: Tools
-            toolGrinder = cropRelative(sheet, 0.045f, 0.605f, 0.295f, 0.795f)
-            toolWipes = cropRelative(sheet, 0.300f, 0.635f, 0.505f, 0.790f)
-            toolTweezers = cropRelative(sheet, 0.525f, 0.620f, 0.725f, 0.795f)
-            toolCream = cropRelative(sheet, 0.735f, 0.610f, 0.950f, 0.795f)
-
-            // 4. Fourth Row: UI Elements
-            bannerSign = try {
-                val bannerOpts = BitmapFactory.Options().apply {
-                    inPreferredConfig = Bitmap.Config.ARGB_8888
-                    inMutable = true
-                }
-                val rawBanner = BitmapFactory.decodeResource(context.resources, R.drawable.banner_sign, bannerOpts)
-                if (rawBanner != null) cleanStainsBackground(rawBanner) else null
+            fun decode(resId: Int): Bitmap? = try {
+                BitmapFactory.decodeResource(context.resources, resId, opts)
             } catch (_: Exception) {
                 null
-            } ?: cropRelative(sheet, 0.030f, 0.800f, 0.440f, 0.985f)
-
-            btnBack = cropRelative(sheet, 0.455f, 0.840f, 0.605f, 0.970f)
-            btnHint = cropRelative(sheet, 0.625f, 0.840f, 0.780f, 0.985f)
-            btnAddTime = cropRelative(sheet, 0.795f, 0.840f, 0.950f, 0.985f)
-
-            // 5. Load Dirt Stains Asset
-            try {
-                val stainsOpts = BitmapFactory.Options().apply {
-                    inPreferredConfig = Bitmap.Config.ARGB_8888
-                    inMutable = true
-                }
-                val rawStains = BitmapFactory.decodeResource(context.resources, R.drawable.dirt_stains, stainsOpts)
-                if (rawStains != null) {
-                    dirtStains = cleanStainsBackground(rawStains)
-                }
-            } catch (_: Exception) {
             }
+
+            treatmentMat = decode(R.drawable.play_treatment_mat)
+
+            // Crop clean & dirty feet to exact visible foot bounds [8,8,508,907] (500x899)
+            cleanFoot = decode(R.drawable.foot_clean)?.let { cropSafe(it, FOOT_VISIBLE_516X915) }
+            dirtyFoot = decode(R.drawable.foot_dirty)?.let { cropSafe(it, FOOT_VISIBLE_516X915) }
+
+            // Crop cream & all 3 peel frames + happy foot to exact [274,87,749,937] (475x850)
+            // so the foot stays completely motionless across every cream & peel transition
+            creamFullFoot = decode(R.drawable.foot_cream_full)?.let { cropSafe(it, PEEL_FOOT_VISIBLE_1024) }
+            peelFrame1 = decode(R.drawable.foot_peel_01)?.let { cropSafe(it, PEEL_FOOT_VISIBLE_1024) }
+            peelFrame2 = decode(R.drawable.foot_peel_02)?.let { cropSafe(it, PEEL_FOOT_VISIBLE_1024) }
+            peelFrame3 = decode(R.drawable.foot_peel_03)?.let { cropSafe(it, PEEL_FOOT_VISIBLE_1024) }
+            cleanHappyFoot = decode(R.drawable.foot_clean_happy)?.let { cropSafe(it, PEEL_FOOT_VISIBLE_1024) }
+
+            // Extract mud-only overlay (with nail regions feathered out) and 5 damaged nail overlays
+            dirtyFoot?.let { dirty ->
+                extractDirtAndNailLayers(dirty)
+            }
+
+            // Tray tools
+            toolTrayGrinder = decode(R.drawable.tool_tray_nail_grinder)
+            toolTrayWipes = decode(R.drawable.tool_tray_wet_wipe)
+            toolTrayTweezers = decode(R.drawable.tool_tray_tweezers)
+            toolTrayCream = decode(R.drawable.tool_tray_cream_tube)
+
+            // In-use draggable tools
+            toolUseGrinder = decode(R.drawable.tool_use_nail_grinder)
+            toolUseWipes = decode(R.drawable.tool_use_wet_wipe)
+            toolUseTweezers = decode(R.drawable.tool_use_tweezers)
+            toolUseCreamOpen = decode(R.drawable.tool_use_cream_open)
+            toolUseCreamApplying = decode(R.drawable.tool_use_cream_applying)
+
+            // Effects
+            fxCreamSparkle = decode(R.drawable.fx_cream_sparkle)
+            fxGoldenSparkle = decode(R.drawable.fx_golden_sparkle)
+            fxSoapBubble = decode(R.drawable.fx_soap_bubble)
+            fxHappyReaction = decode(R.drawable.fx_happy_reaction)
+            fxCreamFilmPeelOff = decode(R.drawable.fx_cream_film_peel_off)
 
             isLoaded = true
         } catch (_: Exception) {
         }
     }
 
-    private fun cropRelative(
-        sheet: Bitmap,
-        leftF: Float,
-        topF: Float,
-        rightF: Float,
-        bottomF: Float
-    ): Bitmap {
-        val x = (leftF * sheet.width).toInt().coerceIn(0, sheet.width - 1)
-        val y = (topF * sheet.height).toInt().coerceIn(0, sheet.height - 1)
-        val w = ((rightF - leftF) * sheet.width).toInt().coerceIn(1, sheet.width - x)
-        val h = ((bottomF - topF) * sheet.height).toInt().coerceIn(1, sheet.height - y)
-
-        val cropped = Bitmap.createBitmap(sheet, x, y, w, h)
-        return trimTransparentBorders(cropped)
+    private fun cropSafe(src: Bitmap, rect: Rect): Bitmap {
+        val left = rect.left.coerceIn(0, src.width - 1)
+        val top = rect.top.coerceIn(0, src.height - 1)
+        val w = rect.width().coerceIn(1, src.width - left)
+        val h = rect.height().coerceIn(1, src.height - top)
+        return Bitmap.createBitmap(src, left, top, w, h)
     }
 
     /**
-     * Cleans background from stains image if needed (white or checkerboard).
+     * Separates the 5 damaged nail regions from the mud/dirt layer on foot_dirty so:
+     * 1. Step 1 (Wet Wipe) erases mud spots to reveal clean skin without prematurely cleaning damaged nails.
+     * 2. Step 3 (Nail Grinder) grinds each damaged nail independently on its exact toe anchor.
      */
-    private fun cleanStainsBackground(src: Bitmap): Bitmap {
-        val w = src.width
-        val h = src.height
-        val corner = src.getPixel(0, 0)
-        // If already transparent at corner, return directly
-        if (Color.alpha(corner) < 20) {
-            return src
+    private fun extractDirtAndNailLayers(dirty: Bitmap) {
+        val w = dirty.width
+        val h = dirty.height
+
+        // 1. Create dirtOnlyFoot by punching soft feathered ovals out of the 5 nail regions
+        val dirtBmp = dirty.copy(Bitmap.Config.ARGB_8888, true)
+        val dirtCanvas = Canvas(dirtBmp)
+        val punchPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            xfermode = PorterDuffXfermode(PorterDuff.Mode.DST_OUT)
         }
 
-        val pixels = IntArray(w * h)
-        src.getPixels(pixels, 0, w, 0, 0, w, h)
-        val visited = BooleanArray(w * h)
-        val queue = ArrayDeque<Int>()
+        damagedNails.clear()
 
-        fun isBgPixel(c: Int): Boolean {
-            val a = Color.alpha(c)
-            if (a < 20) return true
-            val r = Color.red(c)
-            val g = Color.green(c)
-            val b = Color.blue(c)
-            val isWhite = r > 235 && g > 235 && b > 235
-            val isGrayCheck = r > 150 && g > 150 && b > 150 && abs(r - g) <= 22 && abs(g - b) <= 22
-            return isWhite || isGrayCheck
-        }
+        for (anchor in FootAnchors.NAILS) {
+            val l = anchor.normLeft * w
+            val t = anchor.normTop * h
+            val r = anchor.normRight * w
+            val b = anchor.normBottom * h
+            val cx = (l + r) * 0.5f
+            val cy = (t + b) * 0.5f
+            val rx = ((r - l) * 0.5f).coerceAtLeast(1f)
+            val ry = ((b - t) * 0.5f).coerceAtLeast(1f)
 
-        fun enqueue(x: Int, y: Int) {
-            if (x !in 0 until w || y !in 0 until h) return
-            val idx = y * w + x
-            if (!visited[idx]) {
-                visited[idx] = true
-                if (isBgPixel(pixels[idx])) {
-                    pixels[idx] = 0
-                    queue.add(idx)
-                }
+            // Elliptical feathered gradient for DST_OUT
+            val grad = RadialGradient(
+                0f, 0f, 1f,
+                intArrayOf(Color.BLACK, Color.BLACK, Color.TRANSPARENT),
+                floatArrayOf(0f, 0.72f, 1f),
+                Shader.TileMode.CLAMP
+            )
+            val m = Matrix()
+            m.setScale(rx, ry)
+            m.postTranslate(cx, cy)
+            grad.setLocalMatrix(m)
+            punchPaint.shader = grad
+            dirtCanvas.drawOval(RectF(l, t, r, b), punchPaint)
+
+            // 2. Extract the individual damaged nail sprite cropped strictly to [l, t, r, b]
+            val ix = l.toInt().coerceIn(0, w - 1)
+            val iy = t.toInt().coerceIn(0, h - 1)
+            val iw = (r - l).toInt().coerceIn(1, w - ix)
+            val ih = (b - t).toInt().coerceIn(1, h - iy)
+
+            val nailCrop = Bitmap.createBitmap(dirty, ix, iy, iw, ih)
+            val maskedNail = Bitmap.createBitmap(iw, ih, Bitmap.Config.ARGB_8888)
+            val nailCanvas = Canvas(maskedNail)
+
+            // Draw soft feathered oval mask first, then SRC_IN the nail pixels
+            val localMaskPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+            val localGrad = RadialGradient(
+                0f, 0f, 1f,
+                intArrayOf(Color.BLACK, Color.BLACK, Color.TRANSPARENT),
+                floatArrayOf(0f, 0.74f, 1f),
+                Shader.TileMode.CLAMP
+            )
+            val localM = Matrix()
+            localM.setScale(iw * 0.5f, ih * 0.5f)
+            localM.postTranslate(iw * 0.5f, ih * 0.5f)
+            localGrad.setLocalMatrix(localM)
+            localMaskPaint.shader = localGrad
+            nailCanvas.drawOval(RectF(0f, 0f, iw.toFloat(), ih.toFloat()), localMaskPaint)
+
+            val srcInPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                xfermode = PorterDuffXfermode(PorterDuff.Mode.SRC_IN)
             }
+            nailCanvas.drawBitmap(nailCrop, 0f, 0f, srcInPaint)
+            damagedNails.add(maskedNail)
         }
 
-        for (x in 0 until w) {
-            enqueue(x, 0)
-            enqueue(x, h - 1)
-        }
-        for (y in 0 until h) {
-            enqueue(0, y)
-            enqueue(w - 1, y)
-        }
-
-        val dx = intArrayOf(1, -1, 0, 0)
-        val dy = intArrayOf(0, 0, 1, -1)
-
-        while (queue.isNotEmpty()) {
-            val curr = queue.poll() ?: break
-            val cx = curr % w
-            val cy = curr / w
-
-            for (i in 0..3) {
-                val nx = cx + dx[i]
-                val ny = cy + dy[i]
-                if (nx in 0 until w && ny in 0 until h) {
-                    val nIdx = ny * w + nx
-                    if (!visited[nIdx]) {
-                        visited[nIdx] = true
-                        if (isBgPixel(pixels[nIdx])) {
-                            pixels[nIdx] = 0
-                            queue.add(nIdx)
-                        }
-                    }
-                }
-            }
-        }
-
-        val result = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
-        result.setPixels(pixels, 0, w, 0, 0, w, h)
-        return result
-    }
-
-    /**
-     * Removes the gray-and-white checkerboard transparency pattern.
-     * Uses an outside-in boundary flood fill so inner whites and grays remain intact.
-     */
-    private fun makeCheckerboardTransparent(src: Bitmap): Bitmap {
-        val w = src.width
-        val h = src.height
-        val pixels = IntArray(w * h)
-        src.getPixels(pixels, 0, w, 0, 0, w, h)
-
-        val visited = BooleanArray(w * h)
-        val queue = ArrayDeque<Int>()
-
-        fun isCheckerboardPixel(color: Int): Boolean {
-            val r = Color.red(color)
-            val g = Color.green(color)
-            val b = Color.blue(color)
-            // Checkerboard is grayscale with brightness > 155 (squares of ~#CECECE and #FFFFFF)
-            val isNeutral = abs(r - g) <= 22 && abs(g - b) <= 22 && abs(r - b) <= 22
-            return isNeutral && r >= 155 && g >= 155 && b >= 155
-        }
-
-        fun enqueue(x: Int, y: Int) {
-            if (x !in 0 until w || y !in 0 until h) return
-            val idx = y * w + x
-            if (!visited[idx]) {
-                visited[idx] = true
-                if (isCheckerboardPixel(pixels[idx])) {
-                    pixels[idx] = 0 // Transparent
-                    queue.add(idx)
-                }
-            }
-        }
-
-        // Enqueue all perimeter pixels
-        for (x in 0 until w) {
-            enqueue(x, 0)
-            enqueue(x, h - 1)
-        }
-        for (y in 0 until h) {
-            enqueue(0, y)
-            enqueue(w - 1, y)
-        }
-
-        // 4-way flood fill
-        val dx = intArrayOf(1, -1, 0, 0)
-        val dy = intArrayOf(0, 0, 1, -1)
-
-        while (queue.isNotEmpty()) {
-            val curr = queue.poll() ?: break
-            val cx = curr % w
-            val cy = curr / w
-
-            for (i in 0..3) {
-                val nx = cx + dx[i]
-                val ny = cy + dy[i]
-                if (nx in 0 until w && ny in 0 until h) {
-                    val nIdx = ny * w + nx
-                    if (!visited[nIdx]) {
-                        visited[nIdx] = true
-                        if (isCheckerboardPixel(pixels[nIdx])) {
-                            pixels[nIdx] = 0 // Transparent
-                            queue.add(nIdx)
-                        }
-                    }
-                }
-            }
-        }
-
-        val result = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
-        result.setPixels(pixels, 0, w, 0, 0, w, h)
-        return result
-    }
-
-    /**
-     * Trims any empty transparent borders around a sliced sprite.
-     */
-    private fun trimTransparentBorders(bmp: Bitmap): Bitmap {
-        val w = bmp.width
-        val h = bmp.height
-        val pixels = IntArray(w * h)
-        bmp.getPixels(pixels, 0, w, 0, 0, w, h)
-
-        var minX = w
-        var minY = h
-        var maxX = 0
-        var maxY = 0
-
-        for (y in 0 until h) {
-            val rowOffset = y * w
-            for (x in 0 until w) {
-                val alpha = Color.alpha(pixels[rowOffset + x])
-                if (alpha > 20) {
-                    if (x < minX) minX = x
-                    if (x > maxX) maxX = x
-                    if (y < minY) minY = y
-                    if (y > maxY) maxY = y
-                }
-            }
-        }
-
-        if (minX > maxX || minY > maxY) return bmp
-
-        val cropW = maxX - minX + 1
-        val cropH = maxY - minY + 1
-        return Bitmap.createBitmap(bmp, minX, minY, cropW, cropH)
+        dirtOnlyFoot = dirtBmp
     }
 }

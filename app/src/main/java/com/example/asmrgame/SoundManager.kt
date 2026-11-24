@@ -29,6 +29,9 @@ class SoundManager(context: Context) {
         appContext.getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator
     }
 
+    var isSoundEnabled: Boolean = true
+    var isVibrationEnabled: Boolean = true
+
     private var lastVibeTime = 0L
     private var lastSoundTime = 0L
 
@@ -84,6 +87,7 @@ class SoundManager(context: Context) {
     }
 
     private fun playBuffer(buffer: ShortArray, sampleRate: Int) {
+        if (!isSoundEnabled) return
         audioExecutor.execute {
             try {
                 val minSize = AudioTrack.getMinBufferSize(
@@ -147,6 +151,7 @@ class SoundManager(context: Context) {
     }
 
     private fun vibrate(durationMs: Long, amplitude: Int) {
+        if (!isVibrationEnabled) return
         try {
             if (vibrator?.hasVibrator() == true) {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {

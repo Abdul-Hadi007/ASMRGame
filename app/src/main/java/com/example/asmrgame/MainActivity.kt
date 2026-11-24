@@ -72,3 +72,66 @@ fun MakeoverGameScreenPreview() {
         MakeoverGameScreen(onBackPressed = {})
     }
 }
+
+@Preview(showBackground = true, widthDp = 390, heightDp = 844)
+@Composable
+fun GameplayAnchorsPhonePreview() {
+    ASMRGameTheme {
+        MakeoverGameScreen(
+            onBackPressed = {},
+            initialScreen = GameScreen.GAMEPLAY,
+            debugShowAnchors = true
+        )
+    }
+}
+
+@Preview(showBackground = true, widthDp = 768, heightDp = 1024)
+@Composable
+fun GameplayAnchorsTabletPreview() {
+    ASMRGameTheme {
+        MakeoverGameScreen(
+            onBackPressed = {},
+            initialScreen = GameScreen.GAMEPLAY,
+            debugShowAnchors = true
+        )
+    }
+}
+
+@Preview(showBackground = true, widthDp = 390, heightDp = 844)
+@Composable
+fun GameplayPeelFrame1Preview() {
+    ASMRGameTheme {
+        MakeoverGameScreen(
+            onBackPressed = {},
+            initialScreen = GameScreen.GAMEPLAY,
+            debugShowAnchors = true,
+            previewPeelStage = 1
+        )
+    }
+}
+
+@Preview(showBackground = true, widthDp = 390, heightDp = 844)
+@Composable
+fun GameplayPeelFrame2Preview() {
+    ASMRGameTheme {
+        MakeoverGameScreen(
+            onBackPressed = {},
+            initialScreen = GameScreen.GAMEPLAY,
+            debugShowAnchors = true,
+            previewPeelStage = 2
+        )
+    }
+}
+
+@Preview(showBackground = true, widthDp = 390, heightDp = 844)
+@Composable
+fun GameplayPeelFrame3Preview() {
+    ASMRGameTheme {
+        MakeoverGameScreen(
+            onBackPressed = {},
+            initialScreen = GameScreen.GAMEPLAY,
+            debugShowAnchors = true,
+            previewPeelStage = 3
+        )
+    }
+}

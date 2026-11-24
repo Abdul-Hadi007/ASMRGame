@@ -6,21 +6,18 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
-import android.graphics.LinearGradient
+import android.graphics.DashPathEffect
 import android.graphics.Paint
 import android.graphics.Path
 import android.graphics.PointF
 import android.graphics.PorterDuff
 import android.graphics.PorterDuffColorFilter
 import android.graphics.PorterDuffXfermode
-import android.graphics.RadialGradient
 import android.graphics.RectF
-import android.graphics.Shader
 import android.util.AttributeSet
 import android.view.MotionEvent
 import android.view.View
 import android.view.animation.AccelerateDecelerateInterpolator
-import kotlin.math.atan2
 import kotlin.math.cos
 import kotlin.math.hypot
 import kotlin.math.sin
@@ -46,6 +43,27 @@ class MakeoverView @JvmOverloads constructor(
     var onLevelCompletedListener: (() -> Unit)? = null
     var onToolDeselectRequested: (() -> Unit)? = null
 
+    // Preview / Debug inspection flags
+    var showAnchorOverlay: Boolean = false
+        set(value) {
+            field = value
+            invalidate()
+        }
+    var previewPeelStage: Int? = null // null = normal gameplay, 0=full cream, 1=peel1, 2=peel2, 3=peel3
+        set(value) {
+            field = value
+            invalidate()
+        }
+    var previewToolAtAnchor: Pair<ToolType, PointF>? = null
+        set(value) {
+            field = value
+            invalidate()
+        }
+
+    // --- Shared Coordinate Space ---
+    private val matBounds = RectF()
+    private val footBounds = RectF()
+
     // --- Layers ---
     private var dirtBitmap: Bitmap? = null
     private var dirtCanvas: Canvas? = null
@@ -54,7 +72,7 @@ class MakeoverView @JvmOverloads constructor(
     private var creamBitmap: Bitmap? = null
     private var creamCanvas: Canvas? = null
     private var creamFadeAlpha: Float = 1f
-    private var creamAbsorbed = false
+    private var footAlphaMask: Bitmap? = null
 
     // Peel-off mask state
     enum class MaskState {
@@ -71,9 +89,8 @@ class MakeoverView @JvmOverloads constructor(
     private var finishAnimProgress = 0f
     private var isFinishing = false
 
-    // Foot base geometry
-    private val footPath = Path()
-    private val footBounds = RectF()
+    // Interactive targets mapped in shared foot space
+    private val mudSpots = mutableListOf<MudSpot>()
     private val nails = mutableListOf<ToeNail>()
     private val splinters = mutableListOf<Splinter>()
     private val dirtSamplePoints = mutableListOf<PointF>()
@@ -91,99 +108,111 @@ class MakeoverView @JvmOverloads constructor(
     private var lastTouchX = -100f
     private var lastTouchY = -100f
     private var isTouching = false
-    private var grinderRotation = 0f
+    private var grinderJitterPhase = 0f
 
     // Hint Tracking
     private var isHintActive = false
     private var hintProgress = 0f
     private var hintAnimator: ValueAnimator? = null
 
-    // Paints
-    private val footPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        style = Paint.Style.FILL
-    }
-    private val footContourPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        style = Paint.Style.STROKE
-        strokeWidth = 3f
-        color = Color.parseColor("#E4B49F")
-    }
-    private val toeCreasePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        style = Paint.Style.STROKE
-        strokeWidth = 2.5f
-        color = Color.parseColor("#DF9D87")
-    }
-    private val nailBedPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        style = Paint.Style.FILL
-        color = Color.parseColor("#FFC4D0")
-    }
-    private val nailTipPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        style = Paint.Style.FILL
-        color = Color.parseColor("#FFFFFF")
-    }
-    private val overgrownNailPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        style = Paint.Style.FILL
-        color = Color.parseColor("#C9B273")
-    }
-    private val overgrownNailDetailPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        style = Paint.Style.STROKE
-        strokeWidth = 2f
-        color = Color.parseColor("#8E753E")
-    }
+    // --- Pre-allocated Paints ---
     private val erasePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         xfermode = PorterDuffXfermode(PorterDuff.Mode.CLEAR)
         style = Paint.Style.STROKE
-        strokeWidth = 110f
+        strokeWidth = 90f
         strokeCap = Paint.Cap.ROUND
         strokeJoin = Paint.Join.ROUND
     }
     private val creamDepositPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
-        strokeWidth = 95f
+        strokeWidth = 85f
         strokeCap = Paint.Cap.ROUND
         strokeJoin = Paint.Join.ROUND
-        color = Color.argb(215, 255, 179, 0) // Rich translucent golden-orange gel
+        color = Color.argb(215, 255, 167, 38)
     }
     private val creamHighlightPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
-        strokeWidth = 35f
+        strokeWidth = 30f
         strokeCap = Paint.Cap.ROUND
         strokeJoin = Paint.Join.ROUND
-        color = Color.argb(170, 255, 236, 179) // Luminous warm sheen
+        color = Color.argb(165, 255, 236, 179)
     }
-    private val peelEdgePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        style = Paint.Style.STROKE
-        strokeWidth = 8f
-        color = Color.argb(240, 255, 255, 255)
+    private val maskClipPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        xfermode = PorterDuffXfermode(PorterDuff.Mode.DST_IN)
     }
     private val promptPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = Color.parseColor("#E65100")
         textSize = 32f
         textAlign = Paint.Align.CENTER
         isFakeBoldText = true
-        setShadowLayer(8f, 0f, 3f, Color.argb(140, 255, 255, 255))
+        setShadowLayer(8f, 0f, 3f, Color.argb(170, 255, 255, 255))
     }
     private val splinterPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.FILL_AND_STROKE
-        strokeWidth = 3f
+        strokeWidth = 3.5f
         color = Color.parseColor("#4E342E")
     }
     private val splinterHaloPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.FILL
-        color = Color.argb(120, 229, 115, 115)
+        color = Color.argb(125, 229, 115, 115)
     }
     private val particlePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.FILL
     }
     private val toolShadowPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.FILL
-        color = Color.argb(60, 0, 0, 0)
+        color = Color.argb(55, 0, 0, 0)
     }
     private val layerAlphaPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val ringPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+    }
+    private val victoryTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.parseColor("#E65100")
+        textSize = 36f
+        textAlign = Paint.Align.CENTER
+        isFakeBoldText = true
+    }
+
+    // Debug Anchor Overlay Paints
+    private val debugNailBoxPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = 3.5f
+        color = Color.parseColor("#E91E63")
+    }
+    private val debugNailFillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.FILL
+        color = Color.argb(45, 233, 30, 99)
+    }
+    private val debugMudCirclePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = 3.5f
+        pathEffect = DashPathEffect(floatArrayOf(12f, 8f), 0f)
+        color = Color.parseColor("#0288D1")
+    }
+    private val debugMudFillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.FILL
+        color = Color.argb(40, 2, 136, 209)
+    }
+    private val debugCrosshairPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = 2.5f
+        color = Color.WHITE
+    }
+    private val debugLabelBgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.FILL
+        color = Color.argb(210, 38, 50, 56)
+    }
+    private val debugLabelTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.WHITE
+        textSize = 22f
+        textAlign = Paint.Align.CENTER
+        isFakeBoldText = true
+    }
 
     private var activeSplinter: Splinter? = null
 
     init {
-        // Continuous animation loop for particles and tool effects (skip in IDE preview)
         if (!isInEditMode) {
             post(object : Runnable {
                 override fun run() {
@@ -200,207 +229,151 @@ class MakeoverView @JvmOverloads constructor(
         if (w <= 0 || h <= 0) return
 
         SpriteManager.load(context)
-        buildFootGeometry(w.toFloat(), h.toFloat())
+        buildSharedCoordinateSpace(w.toFloat(), h.toFloat())
         initDirtLayer(w, h)
         initCreamLayer(w, h)
     }
 
-    private fun buildFootGeometry(w: Float, h: Float) {
-        // Center the foot nicely in the canvas and zoom to fill the viewport
-        val centerX = w * 0.5f
-        val centerY = h * 0.47f
+    /**
+     * Computes matBounds and footBounds using the exact aspect ratios of treatment_mat (996x1272)
+     * and the visible foot artwork (500x899), ensuring identical alignment across all screen sizes.
+     */
+    private fun buildSharedCoordinateSpace(w: Float, h: Float) {
+        val padX = w * 0.03f
+        val padY = h * 0.015f
+        val availW = (w - padX * 2f).coerceAtLeast(1f)
+        val availH = (h - padY * 2f).coerceAtLeast(1f)
 
-        // Zoom to fill ~88% of canvas width or ~90% of canvas height
-        val targetWidth = w * 0.88f
-        val maxHeight = h * 0.90f
-        val aspect = 1.82f
-
-        val footWidth: Float
-        val footHeight: Float
-        if (targetWidth * aspect <= maxHeight) {
-            footWidth = targetWidth
-            footHeight = targetWidth * aspect
+        val matAspect = 996f / 1272f
+        val matW: Float
+        val matH: Float
+        if (availW / availH <= matAspect) {
+            matW = availW
+            matH = availW / matAspect
         } else {
-            footHeight = maxHeight
-            footWidth = maxHeight / aspect
+            matH = availH
+            matW = availH * matAspect
         }
 
-        footBounds.set(
-            centerX - footWidth * 0.5f,
-            centerY - footHeight * 0.5f,
-            centerX + footWidth * 0.5f,
-            centerY + footHeight * 0.5f
-        )
+        val matLeft = (w - matW) * 0.5f
+        val matTop = (h - matH) * 0.5f
+        matBounds.set(matLeft, matTop, matLeft + matW, matTop + matH)
 
-        // Scale interactive tool brush widths dynamically with foot zoom
-        erasePaint.strokeWidth = footWidth * 0.22f
-        creamDepositPaint.strokeWidth = footWidth * 0.20f
-        creamHighlightPaint.strokeWidth = footWidth * 0.08f
+        // Position foot inside treatment_mat matching 03_gameplay mockup proportions:
+        // Foot visible aspect = 500 / 899 = 0.55617
+        val footAspect = 500f / 899f
+        var footH = matH * 0.875f
+        var footW = footH * footAspect
+        if (footW > matW * 0.72f) {
+            footW = matW * 0.72f
+            footH = footW / footAspect
+        }
+        val footLeft = matBounds.centerX() - footW * 0.5f
+        val footTop = matBounds.top + (matH - footH) * 0.44f
+        footBounds.set(footLeft, footTop, footLeft + footW, footTop + footH)
 
-        footPath.reset()
-        // Top view of a stylized right foot with spread toes
-        val left = footBounds.left
-        val right = footBounds.right
-        val top = footBounds.top + footHeight * 0.16f // toe base line
-        val bottom = footBounds.bottom
+        // Dynamically scale interactive brush strokes and text
+        erasePaint.strokeWidth = footW * 0.22f
+        creamDepositPaint.strokeWidth = footW * 0.20f
+        creamHighlightPaint.strokeWidth = footW * 0.075f
+        promptPaint.textSize = (w * 0.036f).coerceIn(22f, 40f)
+        victoryTextPaint.textSize = (w * 0.045f).coerceIn(26f, 46f)
+        debugLabelTextPaint.textSize = (footW * 0.042f).coerceIn(14f, 26f)
 
-        // Heel at bottom center
-        footPath.moveTo(centerX - footWidth * 0.22f, bottom - footHeight * 0.05f)
-        // Outer edge towards pinky side (right side)
-        footPath.cubicTo(
-            right + footWidth * 0.04f, bottom - footHeight * 0.35f,
-            right + footWidth * 0.02f, top + footHeight * 0.18f,
-            right - footWidth * 0.05f, top
-        )
-        // Ball of foot curve under toes
-        footPath.cubicTo(
-            centerX + footWidth * 0.2f, top - footHeight * 0.04f,
-            centerX - footWidth * 0.2f, top - footHeight * 0.04f,
-            left + footWidth * 0.05f, top
-        )
-        // Inner arch (left side)
-        footPath.cubicTo(
-            left - footWidth * 0.02f, top + footHeight * 0.22f,
-            left + footWidth * 0.14f, bottom - footHeight * 0.35f,
-            centerX - footWidth * 0.22f, bottom - footHeight * 0.05f
-        )
-        // Round heel
-        footPath.cubicTo(
-            centerX - footWidth * 0.15f, bottom,
-            centerX + footWidth * 0.15f, bottom,
-            centerX + footWidth * 0.18f, bottom - footHeight * 0.05f
-        )
-        footPath.close()
+        // Build FootAlphaMask for keeping cream application strictly inside the foot contour
+        SpriteManager.cleanFoot?.let { cleanBmp ->
+            val mask = Bitmap.createBitmap(width.coerceAtLeast(1), height.coerceAtLeast(1), Bitmap.Config.ARGB_8888)
+            val mc = Canvas(mask)
+            mc.drawBitmap(cleanBmp, null, footBounds, null)
+            footAlphaMask = mask
+        }
 
-        // Configure smooth foot skin gradient
-        footPaint.shader = LinearGradient(
-            footBounds.left, footBounds.top,
-            footBounds.right, footBounds.bottom,
-            intArrayOf(
-                Color.parseColor("#FFF0E6"),
-                Color.parseColor("#FCE4D6"),
-                Color.parseColor("#F8CDBA")
-            ),
-            floatArrayOf(0f, 0.45f, 1f),
-            Shader.TileMode.CLAMP
-        )
-
-        // Generate 5 Toes with dynamically scaled nail beds matching zoomed foot
+        // 1. Map the 5 Nails from shared normalized coordinates
         nails.clear()
-        val toeBaseY = top
-        val toeConfigs = listOf(
-            // Big toe (Index 0, Left)
-            ToeConfig("Big Toe", left + footWidth * 0.17f, toeBaseY - footHeight * 0.10f, footWidth * 0.095f, footHeight * 0.070f, -7f),
-            // Index toe
-            ToeConfig("Index Toe", left + footWidth * 0.36f, toeBaseY - footHeight * 0.10f, footWidth * 0.075f, footHeight * 0.060f, -3f),
-            // Middle toe
-            ToeConfig("Middle Toe", left + footWidth * 0.53f, toeBaseY - footHeight * 0.09f, footWidth * 0.070f, footHeight * 0.056f, 2f),
-            // Ring toe
-            ToeConfig("Ring Toe", left + footWidth * 0.69f, toeBaseY - footHeight * 0.07f, footWidth * 0.065f, footHeight * 0.052f, 6f),
-            // Pinky toe
-            ToeConfig("Pinky Toe", left + footWidth * 0.85f, toeBaseY - footHeight * 0.04f, footWidth * 0.055f, footHeight * 0.045f, 10f)
-        )
-
-        for ((idx, cfg) in toeConfigs.withIndex()) {
+        for (a in FootAnchors.NAILS) {
+            val rect = RectF(
+                footBounds.left + a.normLeft * footW,
+                footBounds.top + a.normTop * footH,
+                footBounds.left + a.normRight * footW,
+                footBounds.top + a.normBottom * footH
+            )
             nails.add(
                 ToeNail(
-                    index = idx,
-                    name = cfg.name,
-                    x = cfg.x,
-                    y = cfg.y,
-                    radiusX = cfg.rx,
-                    radiusY = cfg.ry,
-                    rotationDeg = cfg.rot,
+                    index = a.index,
+                    name = a.name,
+                    x = footBounds.left + a.normCenterX * footW,
+                    y = footBounds.top + a.normCenterY * footH,
+                    bounds = rect,
+                    radiusX = rect.width() * 0.5f,
+                    radiusY = rect.height() * 0.5f,
+                    rotationDeg = a.rotationDeg,
                     trimProgress = 0f
                 )
             )
         }
 
-        // Setup 3 splinters scaled with zoomed foot
-        val sLen = footHeight * 0.055f
-        splinters.clear()
-        splinters.add(
-            Splinter(
-                id = 1,
-                x = left + footWidth * 0.28f,
-                y = footBounds.centerY() - footHeight * 0.12f,
-                angleDeg = 35f,
-                length = sLen
+        // 2. Map the 6 Mud Spots from shared normalized coordinates
+        mudSpots.clear()
+        for (m in FootAnchors.MUD_SPOTS) {
+            mudSpots.add(
+                MudSpot(
+                    id = m.id,
+                    name = m.name,
+                    x = footBounds.left + m.normX * footW,
+                    y = footBounds.top + m.normY * footH,
+                    radius = m.radiusRatio * footW,
+                    cleanProgress = 0f
+                )
             )
-        )
-        splinters.add(
-            Splinter(
-                id = 2,
-                x = footBounds.centerX() + footWidth * 0.12f,
-                y = footBounds.centerY() + footHeight * 0.08f,
-                angleDeg = -45f,
-                length = sLen * 0.9f
-            )
-        )
-        splinters.add(
-            Splinter(
-                id = 3,
-                x = left + footWidth * 0.22f,
-                y = footBounds.bottom - footHeight * 0.22f,
-                angleDeg = 70f,
-                length = sLen * 1.05f
-            )
-        )
+        }
 
-        // Setup sample points for dirt cleaning progress scaled with foot
+        // 3. Map the 3 Splinters from shared normalized coordinates
+        splinters.clear()
+        for (s in FootAnchors.SPLINTERS) {
+            splinters.add(
+                Splinter(
+                    id = s.id,
+                    x = footBounds.left + s.normX * footW,
+                    y = footBounds.top + s.normY * footH,
+                    angleDeg = s.angleDeg,
+                    length = s.lengthRatio * footH
+                )
+            )
+        }
+
+        // 4. Sample grid for overall dirt & cream coverage (excluding the 5 nail tips)
         dirtSamplePoints.clear()
-        val gridStep = footWidth * 0.065f
-        var sx = footBounds.left
-        while (sx <= footBounds.right) {
-            var sy = footBounds.top - footHeight * 0.12f
-            while (sy <= footBounds.bottom) {
-                // Keep points reasonably inside the foot/toes area
-                val dx = (sx - footBounds.centerX()) / (footWidth * 0.52f)
-                val dy = (sy - footBounds.centerY()) / (footHeight * 0.55f)
-                if (dx * dx + dy * dy <= 1.05f) {
+        val gridStep = footW * 0.075f
+        var sx = footBounds.left + footW * 0.14f
+        while (sx <= footBounds.right - footW * 0.14f) {
+            var sy = footBounds.top + footH * 0.08f
+            while (sy <= footBounds.top + footH * 0.80f) {
+                val dx = (sx - footBounds.centerX()) / (footW * 0.42f)
+                val dy = (sy - (footBounds.top + footH * 0.44f)) / (footH * 0.42f)
+                if (dx * dx + dy * dy <= 1.0f) {
                     dirtSamplePoints.add(PointF(sx, sy))
                 }
                 sy += gridStep
             }
             sx += gridStep
         }
+        // Also ensure all 6 mud spot centers are in dirt sample points
+        for (spot in mudSpots) {
+            dirtSamplePoints.add(PointF(spot.x, spot.y))
+        }
         cleanedSampleIndices.clear()
 
-        // Setup sample points for cream application
         creamSamplePoints.clear()
         creamSamplePoints.addAll(dirtSamplePoints)
         coveredCreamIndices.clear()
     }
 
-    private data class ToeConfig(
-        val name: String,
-        val x: Float,
-        val y: Float,
-        val rx: Float,
-        val ry: Float,
-        val rot: Float
-    )
-
     private fun initDirtLayer(w: Int, h: Int) {
         val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
         val cvs = Canvas(bmp)
 
-        // Draw realistic dirt stains asset directly over the foot
-        val stainsSprite = SpriteManager.dirtStains
-        if (stainsSprite != null) {
-            // Scale to cover foot sole, arch, and toes
-            val stainsRect = RectF(
-                footBounds.left - footBounds.width() * 0.05f,
-                footBounds.top - footBounds.height() * 0.04f,
-                footBounds.right + footBounds.width() * 0.05f,
-                footBounds.bottom + footBounds.height() * 0.04f
-            )
-            cvs.drawBitmap(stainsSprite, null, stainsRect, null)
-        } else {
-            // Fallback to sprite sheet dirt overlay
-            SpriteManager.dirtOverlay?.let { dirtSprite ->
-                cvs.drawBitmap(dirtSprite, null, footBounds, null)
-            }
+        SpriteManager.dirtOnlyFoot?.let { dirtBmp ->
+            cvs.drawBitmap(dirtBmp, null, footBounds, null)
         }
 
         dirtBitmap = bmp
@@ -413,17 +386,13 @@ class MakeoverView @JvmOverloads constructor(
         creamBitmap = bmp
         creamCanvas = Canvas(bmp)
         creamFadeAlpha = 1f
-        creamAbsorbed = false
     }
-
-    // --- Frame Update (Particles, Grinder Spin, Animations) ---
 
     private fun updateFrame() {
         if (activeTool == ToolType.NAIL_GRINDER && isTouching) {
-            grinderRotation = (grinderRotation + 35f) % 360f
+            grinderJitterPhase += 0.65f
         }
 
-        // Update particles
         val iter = particles.iterator()
         while (iter.hasNext()) {
             val p = iter.next()
@@ -438,321 +407,101 @@ class MakeoverView @JvmOverloads constructor(
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
 
-        val cx = footBounds.centerX()
-        val cy = footBounds.centerY()
+        // 0. Draw Treatment Mat Background
+        SpriteManager.treatmentMat?.let { mat ->
+            canvas.drawBitmap(mat, null, matBounds, null)
+        }
 
-        // Rotate the entire foot 180 degrees so toes point downward towards tools/player
-        canvas.save()
-        canvas.rotate(180f, cx, cy)
+        // Handle explicit Preview Stage inspection (for verifying stationary foot across peel frames)
+        val peelStage = previewPeelStage
+        if (peelStage != null) {
+            val frameBmp = when (peelStage) {
+                0 -> SpriteManager.creamFullFoot
+                1 -> SpriteManager.peelFrame1
+                2 -> SpriteManager.peelFrame2
+                3 -> SpriteManager.peelFrame3
+                else -> SpriteManager.cleanHappyFoot ?: SpriteManager.cleanFoot
+            }
+            if (frameBmp != null) {
+                canvas.drawBitmap(frameBmp, null, footBounds, null)
+            }
+            if (showAnchorOverlay) {
+                drawAnchorDebugOverlay(canvas)
+            }
+            return
+        }
 
-        // 1. Draw Clean Base Foot & Toes
-        drawBaseFoot(canvas)
+        // 1. Draw Clean Base Foot
+        SpriteManager.cleanFoot?.let { cleanBmp ->
+            canvas.drawBitmap(cleanBmp, null, footBounds, null)
+        }
 
-        // 2. Draw Overgrown Nails Layer (drawn on top of clean nail beds)
-        drawOvergrownNails(canvas)
-
-        // 3. Draw Splinters (Tweezers target)
-        drawSplinters(canvas)
-
-        // 4. Draw Dirt Layer (with PorterDuff.Mode.CLEAR erase holes and fade-out)
+        // 2. Draw Mud/Dirt Layer (PorterDuff.Mode.CLEAR holes reveal clean skin beneath)
         dirtBitmap?.let { bmp ->
             if (dirtFadeAlpha > 0f) {
-                val alphaInt = (dirtFadeAlpha * 255).toInt().coerceIn(0, 255)
-                layerAlphaPaint.alpha = alphaInt
+                layerAlphaPaint.alpha = (dirtFadeAlpha * 255).toInt().coerceIn(0, 255)
+                layerAlphaPaint.colorFilter = null
                 canvas.drawBitmap(bmp, 0f, 0f, layerAlphaPaint)
             }
         }
 
-        // 5. Draw Cream / Peel-off Mask Layer
-        creamBitmap?.let { bmp ->
-            if (creamFadeAlpha > 0f) {
-                val alphaInt = (creamFadeAlpha * 255).toInt().coerceIn(0, 255)
-                layerAlphaPaint.alpha = alphaInt
+        // 3. Draw 5 Damaged Overgrown Nails aligned 1:1 on their toes
+        drawDamagedNails(canvas)
 
-                // Dynamic Color Filter when drying/dried:
-                // Smoothly transforms wet bright golden gel into a deep, dried amber-bronze peelable film
-                if (maskDryProgress > 0f) {
-                    val tintColor = Color.argb(
-                        (maskDryProgress * 155).toInt(),
-                        216,
-                        67,
-                        21
-                    )
-                    layerAlphaPaint.colorFilter = PorterDuffColorFilter(tintColor, PorterDuff.Mode.SRC_ATOP)
-                } else {
-                    layerAlphaPaint.colorFilter = null
-                }
+        // 4. Draw Splinters (Tweezers target)
+        drawSplinters(canvas)
 
-                if (maskState == MaskState.PEELABLE && maskPeelProgress > 0f) {
-                    canvas.save()
-                    // Mask peels from toes (top in foot space) down towards heel (bottom in foot space)
-                    val peelY = footBounds.top + footBounds.height() * maskPeelProgress
-                    canvas.clipRect(0f, peelY, width.toFloat(), height.toFloat())
-                    canvas.drawBitmap(bmp, 0f, 0f, layerAlphaPaint)
-                    // Draw glossy peel edge seam
-                    canvas.drawLine(footBounds.left, peelY, footBounds.right, peelY, peelEdgePaint)
-                    canvas.restore()
-                } else {
-                    canvas.drawBitmap(bmp, 0f, 0f, layerAlphaPaint)
-                }
+        // 5. Draw Cream / Peel-off Animation Layer (foot stays 100% locked at footBounds!)
+        drawCreamAndPeelLayer(canvas)
 
-                layerAlphaPaint.colorFilter = null
-            }
-        }
-
-        // 7. Draw Hint Guide (if active)
+        // 6. Draw Hint Pulse (if active)
         if (isHintActive) {
             drawHintGuidance(canvas)
         }
 
-        canvas.restore()
+        // 7. Draw Debug Anchor Overlay (if enabled in Preview)
+        if (showAnchorOverlay) {
+            drawAnchorDebugOverlay(canvas)
+        }
 
-        // 6. Draw Particles (dust, sparks, sparkles, bubbles, confetti in screen space)
+        // 8. Draw Particles
         drawParticles(canvas)
 
-        // Floating peel prompt when mask is dry and ready to peel
-        if (maskState == MaskState.PEELABLE && currentStep == GameStep.APPLY_CREAM) {
-            canvas.drawText("✨ Mask is dry! Deselect tool & drag up to peel! ✨", cx, footBounds.bottom + 45f, promptPaint)
-        }
-
-        // Cool Finishing Shockwave Glow Rings & Victory Banner
-        if (finishAnimProgress > 0f) {
-            val maxR = hypot(width.toFloat(), height.toFloat()) * 0.55f
-            for (ring in 0..2) {
-                val ringProg = (finishAnimProgress * 1.4f - ring * 0.22f).coerceIn(0f, 1f)
-                if (ringProg > 0f && ringProg < 1f) {
-                    val ringRadius = maxR * ringProg
-                    val ringAlpha = ((1f - ringProg) * 200).toInt()
-                    val ringPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                        style = Paint.Style.STROKE
-                        strokeWidth = 14f * (1f - ringProg)
-                        color = Color.argb(ringAlpha, 255, 215, 0)
-                    }
-                    canvas.drawCircle(cx, cy, ringRadius, ringPaint)
-                }
-            }
-
-            if (finishAnimProgress in 0.15f..0.95f) {
-                val bannerAlpha = if (finishAnimProgress < 0.45f) {
-                    ((finishAnimProgress - 0.15f) / 0.3f * 255).toInt()
-                } else {
-                    ((0.95f - finishAnimProgress) / 0.5f * 255).toInt()
-                }.coerceIn(0, 255)
-
-                val victoryTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                    color = Color.parseColor("#E65100")
-                    alpha = bannerAlpha
-                    textSize = 38f
-                    textAlign = Paint.Align.CENTER
-                    isFakeBoldText = true
-                    setShadowLayer(14f, 0f, 4f, Color.argb(bannerAlpha, 255, 238, 88))
-                }
-                canvas.drawText("✨ PERFECT RESTORATION! ✨", cx, footBounds.centerY() + 15f, victoryTextPaint)
-            }
-        }
-
-        // 8. Draw Active Dragged Tool (follows touch naturally in screen space)
-        if (isTouching) {
-            drawActiveTool(canvas, touchX, touchY)
-        }
-    }
-
-    // --- Layer 1: Base Foot & Toes ---
-
-    private fun drawBaseFoot(canvas: Canvas) {
-        val footSprite = SpriteManager.cleanFoot
-        if (footSprite != null) {
-            // Soft drop shadow under the foot
-            val shadowRect = RectF(footBounds).apply { offset(10f, 16f) }
-            canvas.drawBitmap(footSprite, null, shadowRect, toolShadowPaint)
-            // Main clean foot sprite
-            canvas.drawBitmap(footSprite, null, footBounds, null)
-            return
-        }
-
-        // Procedural fallback
-        canvas.save()
-        canvas.translate(8f, 14f)
-        val shadowPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.argb(35, 0, 0, 0)
-            style = Paint.Style.FILL
-        }
-        canvas.drawPath(footPath, shadowPaint)
-        for (nail in nails) {
-            canvas.drawOval(
-                nail.x - nail.radiusX * 1.3f,
-                nail.y - nail.radiusY * 1.3f,
-                nail.x + nail.radiusX * 1.3f,
-                nail.y + nail.radiusY * 1.3f,
-                shadowPaint
-            )
-        }
-        canvas.restore()
-
-        // Main foot sole & top
-        canvas.drawPath(footPath, footPaint)
-        canvas.drawPath(footPath, footContourPaint)
-
-        // Toe bases & toe pads
-        for (nail in nails) {
-            canvas.save()
-            canvas.rotate(nail.rotationDeg, nail.x, nail.y)
-
-            // Toe Flesh Pad
-            val toePadPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                shader = RadialGradient(
-                    nail.x, nail.y,
-                    nail.radiusY * 1.4f,
-                    Color.parseColor("#FFF3EC"),
-                    Color.parseColor("#F7CEBA"),
-                    Shader.TileMode.CLAMP
-                )
-            }
-            canvas.drawOval(
-                nail.x - nail.radiusX * 1.25f,
-                nail.y - nail.radiusY * 1.25f,
-                nail.x + nail.radiusX * 1.25f,
-                nail.y + nail.radiusY * 1.25f,
-                toePadPaint
-            )
-            canvas.drawOval(
-                nail.x - nail.radiusX * 1.25f,
-                nail.y - nail.radiusY * 1.25f,
-                nail.x + nail.radiusX * 1.25f,
-                nail.y + nail.radiusY * 1.25f,
-                footContourPaint
-            )
-
-            // Toe Knuckle / Crease Lines
-            canvas.drawLine(
-                nail.x - nail.radiusX * 0.7f, nail.y + nail.radiusY * 0.75f,
-                nail.x + nail.radiusX * 0.7f, nail.y + nail.radiusY * 0.75f,
-                toeCreasePaint
-            )
-            canvas.drawLine(
-                nail.x - nail.radiusX * 0.5f, nail.y + nail.radiusY * 0.95f,
-                nail.x + nail.radiusX * 0.5f, nail.y + nail.radiusY * 0.95f,
-                toeCreasePaint
-            )
-
-            // Clean, pristine manicured nail bed (Base Layer)
-            val nailBedRect = RectF(
-                nail.x - nail.radiusX * 0.85f,
-                nail.y - nail.radiusY * 0.95f,
-                nail.x + nail.radiusX * 0.85f,
-                nail.y + nail.radiusY * 0.35f
-            )
-            canvas.drawRoundRect(nailBedRect, 18f, 18f, nailBedPaint)
-
-            // White clean French tip
-            val tipRect = RectF(
-                nail.x - nail.radiusX * 0.85f,
-                nail.y - nail.radiusY * 0.95f,
-                nail.x + nail.radiusX * 0.85f,
-                nail.y - nail.radiusY * 0.65f
-            )
-            canvas.drawRoundRect(tipRect, 14f, 14f, nailTipPaint)
-
-            // Glossy nail highlight reflection
-            val glossPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                color = Color.argb(140, 255, 255, 255)
-                style = Paint.Style.STROKE
-                strokeWidth = 3f
-                strokeCap = Paint.Cap.ROUND
-            }
-            canvas.drawLine(
-                nail.x - nail.radiusX * 0.4f, nail.y - nail.radiusY * 0.5f,
-                nail.x - nail.radiusX * 0.4f, nail.y + nail.radiusY * 0.1f,
-                glossPaint
-            )
-
-            canvas.restore()
-        }
-
-        // Subtle skin wrinkles & sole contour lines
-        val soleWrinklePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            style = Paint.Style.STROKE
-            strokeWidth = 2f
-            color = Color.argb(60, 220, 140, 120)
-        }
+        // 9. Peel prompt & Finishing Victory Banner
         val cx = footBounds.centerX()
-        val cy = footBounds.centerY()
-        canvas.drawArc(RectF(cx - 80f, cy - 30f, cx + 80f, cy + 30f), 30f, 120f, false, soleWrinklePaint)
-        canvas.drawArc(RectF(cx - 60f, cy + 60f, cx + 60f, cy + 110f), 20f, 130f, false, soleWrinklePaint)
+        if (maskState == MaskState.PEELABLE && currentStep == GameStep.APPLY_CREAM) {
+            canvas.drawText("✨ Mask is dry! Drag upward to peel! ✨", cx, footBounds.bottom + 36f, promptPaint)
+        }
+
+        if (finishAnimProgress > 0f) {
+            drawFinishingCelebration(canvas, cx, footBounds.centerY())
+        }
+
+        // 10. Draw Active Tool (contact tip follows finger directly!)
+        val previewTool = previewToolAtAnchor
+        if (previewTool != null) {
+            drawActiveTool(canvas, previewTool.first, previewTool.second.x, previewTool.second.y)
+        } else if (isTouching) {
+            activeTool?.let { tool ->
+                drawActiveTool(canvas, tool, touchX, touchY)
+            }
+        }
     }
 
-    // --- Layer 2: Overgrown Nails Layer ---
-
-    private fun drawOvergrownNails(canvas: Canvas) {
-        val nailSprites = SpriteManager.overgrownNails
+    private fun drawDamagedNails(canvas: Canvas) {
+        val nailSprites = SpriteManager.damagedNails
         for ((idx, nail) in nails.withIndex()) {
             val remain = 1f - nail.trimProgress
-            if (remain <= 0.01f) continue // fully trimmed!
+            if (remain <= 0.01f) continue
 
-            // Correctly map damaged nail sprites to specific toes:
-            // [0]: Big toe, [1]: Index toe, [2]: Middle toe, [4]: Ring toe, [5]: Pinky toe
-            val spriteIndex = when (idx) {
-                0 -> 0 // Big Toe
-                1 -> 1 // Index Toe
-                2 -> 2 // Middle Toe
-                3 -> 4 // Ring Toe
-                4 -> 5 // Pinky Toe
-                else -> idx
-            }
-            val sprite = nailSprites.getOrNull(spriteIndex)
-
-            if (sprite != null) {
-                canvas.save()
-                canvas.rotate(nail.rotationDeg, nail.x, nail.y)
-                val nw = nail.radiusX * 2.05f
-                val nh = nw * (sprite.height.toFloat() / sprite.width.toFloat()) * remain
-                val nailCenterY = nail.y - nail.radiusY * 0.30f
-                val nailRect = RectF(
-                    nail.x - nw * 0.5f,
-                    nailCenterY - nh * 0.5f,
-                    nail.x + nw * 0.5f,
-                    nailCenterY + nh * 0.5f
-                )
-                layerAlphaPaint.alpha = (remain * 255).toInt().coerceIn(0, 255)
-                canvas.drawBitmap(sprite, null, nailRect, layerAlphaPaint)
-                canvas.restore()
-            } else {
-                canvas.save()
-                canvas.rotate(nail.rotationDeg, nail.x, nail.y)
-                val overgrownHeight = (nail.radiusY * 1.1f) * remain
-                val topY = nail.y - nail.radiusY * 0.95f - overgrownHeight
-                val nailW = nail.radiusX * 0.88f
-
-                val overgrownPath = Path().apply {
-                    moveTo(nail.x - nailW, nail.y - nail.radiusY * 0.65f)
-                    lineTo(nail.x - nailW * 1.15f, topY + overgrownHeight * 0.4f)
-                    lineTo(nail.x - nailW * 0.5f, topY - 4f)
-                    lineTo(nail.x - nailW * 0.1f, topY + 6f)
-                    lineTo(nail.x + nailW * 0.4f, topY - 6f)
-                    lineTo(nail.x + nailW * 1.12f, topY + overgrownHeight * 0.35f)
-                    lineTo(nail.x + nailW, nail.y - nail.radiusY * 0.65f)
-                    close()
-                }
-
-                canvas.drawPath(overgrownPath, overgrownNailPaint)
-                canvas.drawPath(overgrownPath, overgrownNailDetailPaint)
-                canvas.restore()
-            }
+            val sprite = nailSprites.getOrNull(idx) ?: continue
+            layerAlphaPaint.alpha = (remain * 255).toInt().coerceIn(0, 255)
+            layerAlphaPaint.colorFilter = null
+            canvas.drawBitmap(sprite, null, nail.bounds, layerAlphaPaint)
         }
     }
 
-    // --- Layer 3: Splinters Layer ---
-
     private fun drawSplinters(canvas: Canvas) {
-        val hairSprite = SpriteManager.hairOverlay
-        if (hairSprite != null) {
-            val remainSplinters = splinters.count { !it.isRemoved }
-            if (remainSplinters > 0) {
-                layerAlphaPaint.alpha = ((remainSplinters / splinters.size.toFloat()) * 255).toInt().coerceIn(0, 255)
-                canvas.drawBitmap(hairSprite, null, footBounds, layerAlphaPaint)
-            }
-        }
-
         for (splinter in splinters) {
             if (splinter.isRemoved) continue
 
@@ -760,50 +509,215 @@ class MakeoverView @JvmOverloads constructor(
             canvas.translate(splinter.x, splinter.y)
             canvas.rotate(splinter.angleDeg)
 
-            // Red irritated skin halo around puncture
-            val haloRadius = 18f * (1f - (splinter.pullDistance / 80f)).coerceAtLeast(0.3f)
+            val haloRadius = 16f * (1f - (splinter.pullDistance / 80f)).coerceAtLeast(0.35f)
             canvas.drawCircle(0f, 0f, haloRadius, splinterHaloPaint)
 
-            // Splinter body shifting along pull distance
             val currentOffset = -splinter.pullDistance
-            val splinterPath = Path().apply {
+            val path = Path().apply {
                 moveTo(-3.5f, currentOffset)
                 lineTo(3.5f, currentOffset)
                 lineTo(0f, currentOffset - splinter.length)
                 close()
             }
-            canvas.drawPath(splinterPath, splinterPaint)
-
-            // Tiny barb hook on splinter
+            canvas.drawPath(path, splinterPaint)
             canvas.drawLine(
                 1f, currentOffset - splinter.length * 0.5f,
                 5f, currentOffset - splinter.length * 0.6f,
                 splinterPaint
             )
-
             canvas.restore()
         }
     }
 
-    // --- Layer 6: Particles ---
+    private fun drawCreamAndPeelLayer(canvas: Canvas) {
+        when (maskState) {
+            MaskState.APPLYING -> {
+                creamBitmap?.let { bmp ->
+                    val saveId = canvas.saveLayer(footBounds, null)
+                    canvas.drawBitmap(bmp, 0f, 0f, null)
+                    footAlphaMask?.let { mask ->
+                        canvas.drawBitmap(mask, 0f, 0f, maskClipPaint)
+                    }
+                    canvas.restoreToCount(saveId)
+                }
+            }
+            MaskState.DRYING -> {
+                // Blend from brushed strokes into the crisp 01_cream_fully_applied frame
+                creamBitmap?.let { bmp ->
+                    layerAlphaPaint.alpha = ((1f - maskDryProgress) * 255).toInt().coerceIn(0, 255)
+                    layerAlphaPaint.colorFilter = null
+                    val saveId = canvas.saveLayer(footBounds, null)
+                    canvas.drawBitmap(bmp, 0f, 0f, layerAlphaPaint)
+                    footAlphaMask?.let { mask ->
+                        canvas.drawBitmap(mask, 0f, 0f, maskClipPaint)
+                    }
+                    canvas.restoreToCount(saveId)
+                }
+                SpriteManager.creamFullFoot?.let { fullBmp ->
+                    layerAlphaPaint.alpha = (maskDryProgress * 255).toInt().coerceIn(0, 255)
+                    // Subtle warm darkening as cream dries into peelable film
+                    val dryTint = Color.argb((maskDryProgress * 45).toInt(), 191, 54, 12)
+                    layerAlphaPaint.colorFilter = PorterDuffColorFilter(dryTint, PorterDuff.Mode.SRC_ATOP)
+                    canvas.drawBitmap(fullBmp, null, footBounds, layerAlphaPaint)
+                    layerAlphaPaint.colorFilter = null
+                }
+            }
+            MaskState.PEELABLE -> {
+                // Smoothly step through cream_full -> peel_01 -> peel_02 -> peel_03
+                // All bitmaps share exact footBounds so the foot stays completely motionless!
+                val frameBmp = when {
+                    maskPeelProgress < 0.18f -> SpriteManager.creamFullFoot
+                    maskPeelProgress < 0.45f -> SpriteManager.peelFrame1
+                    maskPeelProgress < 0.72f -> SpriteManager.peelFrame2
+                    else -> SpriteManager.peelFrame3
+                }
+                frameBmp?.let { bmp ->
+                    layerAlphaPaint.alpha = 255
+                    layerAlphaPaint.colorFilter = null
+                    canvas.drawBitmap(bmp, null, footBounds, layerAlphaPaint)
+                }
+            }
+            MaskState.PEELED -> {
+                // Smoothly reveal cleanHappyFoot + happy reaction badge
+                val happyFoot = SpriteManager.cleanHappyFoot ?: SpriteManager.cleanFoot
+                happyFoot?.let { bmp ->
+                    layerAlphaPaint.alpha = 255
+                    layerAlphaPaint.colorFilter = null
+                    canvas.drawBitmap(bmp, null, footBounds, layerAlphaPaint)
+                }
+                SpriteManager.fxHappyReaction?.let { badge ->
+                    val badgeSize = footBounds.width() * 0.28f
+                    val badgeRect = RectF(
+                        footBounds.right - badgeSize * 0.35f,
+                        footBounds.top + footBounds.height() * 0.10f,
+                        footBounds.right + badgeSize * 0.65f,
+                        footBounds.top + footBounds.height() * 0.10f + badgeSize
+                    )
+                    canvas.drawBitmap(badge, null, badgeRect, null)
+                }
+            }
+        }
+    }
+
+    private fun drawFinishingCelebration(canvas: Canvas, cx: Float, cy: Float) {
+        val maxR = hypot(width.toFloat(), height.toFloat()) * 0.55f
+        for (ring in 0..2) {
+            val ringProg = (finishAnimProgress * 1.4f - ring * 0.22f).coerceIn(0f, 1f)
+            if (ringProg > 0f && ringProg < 1f) {
+                val ringRadius = maxR * ringProg
+                val ringAlpha = ((1f - ringProg) * 200).toInt()
+                ringPaint.strokeWidth = 14f * (1f - ringProg)
+                ringPaint.color = Color.argb(ringAlpha, 255, 215, 0)
+                canvas.drawCircle(cx, cy, ringRadius, ringPaint)
+            }
+        }
+
+        if (finishAnimProgress in 0.15f..0.95f) {
+            val bannerAlpha = if (finishAnimProgress < 0.45f) {
+                ((finishAnimProgress - 0.15f) / 0.3f * 255).toInt()
+            } else {
+                ((0.95f - finishAnimProgress) / 0.5f * 255).toInt()
+            }.coerceIn(0, 255)
+
+            victoryTextPaint.alpha = bannerAlpha
+            victoryTextPaint.setShadowLayer(14f, 0f, 4f, Color.argb(bannerAlpha, 255, 238, 88))
+            canvas.drawText("✨ PERFECT RESTORATION! ✨", cx, footBounds.centerY(), victoryTextPaint)
+        }
+    }
+
+    /**
+     * Renders the 5 nail anchor rects + 6 mud spot circles directly over the foot
+     * for visual alignment inspection.
+     */
+    private fun drawAnchorDebugOverlay(canvas: Canvas) {
+        // 6 Mud Spots (Blue dashed circles + M1..M6 labels)
+        for (spot in mudSpots) {
+            canvas.drawCircle(spot.x, spot.y, spot.radius, debugMudFillPaint)
+            canvas.drawCircle(spot.x, spot.y, spot.radius, debugMudCirclePaint)
+            canvas.drawLine(spot.x - 10f, spot.y, spot.x + 10f, spot.y, debugCrosshairPaint)
+            canvas.drawLine(spot.x, spot.y - 10f, spot.x, spot.y + 10f, debugCrosshairPaint)
+
+            val label = "M${spot.id}"
+            val tw = debugLabelTextPaint.measureText(label)
+            val pill = RectF(spot.x - tw * 0.65f, spot.y - 28f, spot.x + tw * 0.65f, spot.y - 4f)
+            canvas.drawRoundRect(pill, 6f, 6f, debugLabelBgPaint)
+            canvas.drawText(label, spot.x, spot.y - 9f, debugLabelTextPaint)
+        }
+
+        // 5 Nail Anchors (Pink boxes + N1..N5 labels)
+        for ((idx, nail) in nails.withIndex()) {
+            canvas.drawRect(nail.bounds, debugNailFillPaint)
+            canvas.drawRect(nail.bounds, debugNailBoxPaint)
+            canvas.drawLine(nail.x - 8f, nail.y, nail.x + 8f, nail.y, debugCrosshairPaint)
+            canvas.drawLine(nail.x, nail.y - 8f, nail.x, nail.y + 8f, debugCrosshairPaint)
+
+            val label = "N${idx + 1}"
+            val tw = debugLabelTextPaint.measureText(label)
+            val ly = nail.bounds.bottom + 24f
+            val pill = RectF(nail.x - tw * 0.65f, ly - 20f, nail.x + tw * 0.65f, ly + 4f)
+            canvas.drawRoundRect(pill, 6f, 6f, debugLabelBgPaint)
+            canvas.drawText(label, nail.x, ly - 1f, debugLabelTextPaint)
+        }
+    }
+
+    // --- Active Tool Rendering (Exact Contact Point Follows Finger) ---
+
+    private fun drawActiveTool(
+        canvas: Canvas,
+        tool: ToolType,
+        x: Float,
+        y: Float
+    ) {
+        val sprite = when (tool) {
+            ToolType.NAIL_GRINDER -> SpriteManager.toolUseGrinder
+            ToolType.WET_WIPE -> SpriteManager.toolUseWipes
+            ToolType.TWEEZERS -> SpriteManager.toolUseTweezers
+            ToolType.CREAM_TUBE -> SpriteManager.toolUseCreamApplying ?: SpriteManager.toolUseCreamOpen
+        } ?: return
+
+        val (contactXRatio, contactYRatio) = FootAnchors.getToolContactNormalized(tool)
+        val baseScale = when (tool) {
+            ToolType.WET_WIPE -> 0.25f
+            else -> 0.34f
+        }
+        val toolSize = (matBounds.width() * baseScale).coerceIn(160f, 340f)
+
+        // Subtle tactile vibration offset for spinning grinder
+        val jitterX = if (tool == ToolType.NAIL_GRINDER && isTouching) cos(grinderJitterPhase) * 2.5f else 0f
+        val jitterY = if (tool == ToolType.NAIL_GRINDER && isTouching) sin(grinderJitterPhase * 1.3f) * 2.5f else 0f
+
+        val left = x - contactXRatio * toolSize + jitterX
+        val top = y - contactYRatio * toolSize + jitterY
+        val destRect = RectF(left, top, left + toolSize, top + toolSize)
+
+        val shadowRect = RectF(destRect).apply { offset(8f, 12f) }
+        canvas.drawBitmap(sprite, null, shadowRect, toolShadowPaint)
+        canvas.drawBitmap(sprite, null, destRect, null)
+    }
+
+    // --- Particles & Hint ---
 
     private fun drawParticles(canvas: Canvas) {
+        val goldSparkle = SpriteManager.fxGoldenSparkle
+        val creamSparkle = SpriteManager.fxCreamSparkle
+
         for (p in particles) {
             particlePaint.color = p.color
             particlePaint.alpha = (p.alpha * 255).toInt().coerceIn(0, 255)
 
             when (p.type) {
-                ParticleType.SPARK -> {
-                    canvas.drawCircle(p.x, p.y, p.size, particlePaint)
-                }
-                ParticleType.DUST -> {
-                    canvas.drawCircle(p.x, p.y, p.size, particlePaint)
-                }
                 ParticleType.SPARKLE -> {
-                    drawStar(canvas, p.x, p.y, p.size, p.rotation, particlePaint)
-                }
-                ParticleType.CREAM_DROP -> {
-                    canvas.drawCircle(p.x, p.y, p.size, particlePaint)
+                    val bmp = if (p.color == Color.parseColor("#FFE082")) creamSparkle else goldSparkle
+                    if (bmp != null) {
+                        canvas.save()
+                        canvas.rotate(p.rotation, p.x, p.y)
+                        val r = p.size * 1.4f
+                        layerAlphaPaint.alpha = (p.alpha * 255).toInt().coerceIn(0, 255)
+                        canvas.drawBitmap(bmp, null, RectF(p.x - r, p.y - r, p.x + r, p.y + r), layerAlphaPaint)
+                        canvas.restore()
+                    } else {
+                        drawStar(canvas, p.x, p.y, p.size, p.rotation, particlePaint)
+                    }
                 }
                 ParticleType.CONFETTI -> {
                     canvas.save()
@@ -812,7 +726,7 @@ class MakeoverView @JvmOverloads constructor(
                     canvas.drawRect(-p.size, -p.size * 0.5f, p.size, p.size * 0.5f, particlePaint)
                     canvas.restore()
                 }
-                ParticleType.MOISTURE -> {
+                else -> {
                     canvas.drawCircle(p.x, p.y, p.size, particlePaint)
                 }
             }
@@ -826,42 +740,32 @@ class MakeoverView @JvmOverloads constructor(
         for (i in 0 until numPoints * 2) {
             val r = if (i % 2 == 0) radius else innerRadius
             val angle = rot + (i * Math.PI / numPoints).toFloat()
-            val x = cx + cos(angle) * r
-            val y = cy + sin(angle) * r
-            if (i == 0) path.moveTo(x, y) else path.lineTo(x, y)
+            val px = cx + cos(angle) * r
+            val py = cy + sin(angle) * r
+            if (i == 0) path.moveTo(px, py) else path.lineTo(px, py)
         }
         path.close()
         canvas.drawPath(path, paint)
     }
 
-    // --- Hint Visual Guidance ---
-
     private fun drawHintGuidance(canvas: Canvas) {
-        val target = getHintTargetPoint()
-        if (target != null) {
-            val pulseRadius = 35f + 20f * hintProgress
-            val ringPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                style = Paint.Style.STROKE
-                strokeWidth = 6f
-                color = Color.parseColor("#FFCA28")
-                alpha = ((1f - hintProgress) * 255).toInt().coerceIn(0, 255)
-            }
-            canvas.drawCircle(target.x, target.y, pulseRadius, ringPaint)
+        val target = getHintTargetPoint() ?: return
+        val pulseRadius = 32f + 22f * hintProgress
+        ringPaint.strokeWidth = 6f
+        ringPaint.color = Color.parseColor("#FFCA28")
+        ringPaint.alpha = ((1f - hintProgress) * 255).toInt().coerceIn(0, 255)
+        canvas.drawCircle(target.x, target.y, pulseRadius, ringPaint)
 
-            // Little animated star indicator
-            val starPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                style = Paint.Style.FILL
-                color = Color.parseColor("#FFA000")
-            }
-            drawStar(canvas, target.x, target.y - 45f + 10f * hintProgress, 18f, hintProgress * 180f, starPaint)
-        }
+        particlePaint.color = Color.parseColor("#FFA000")
+        particlePaint.alpha = 255
+        drawStar(canvas, target.x, target.y - 42f + 10f * hintProgress, 18f, hintProgress * 180f, particlePaint)
     }
 
     private fun getHintTargetPoint(): PointF? {
         return when (currentStep) {
             GameStep.CLEAN_DIRT -> {
-                // Find first uncleaned dirt sample point
-                dirtSamplePoints.firstOrNull { !cleanedSampleIndices.contains(dirtSamplePoints.indexOf(it)) }
+                mudSpots.firstOrNull { it.cleanProgress < 1f }?.let { PointF(it.x, it.y) }
+                    ?: dirtSamplePoints.firstOrNull { !cleanedSampleIndices.contains(dirtSamplePoints.indexOf(it)) }
                     ?: PointF(footBounds.centerX(), footBounds.centerY())
             }
             GameStep.PLUCK_SPLINTERS -> {
@@ -878,287 +782,25 @@ class MakeoverView @JvmOverloads constructor(
         }
     }
 
-    // --- Tool Drawing on Canvas ---
-
-    private fun drawActiveTool(canvas: Canvas, x: Float, y: Float) {
-        val tool = activeTool ?: return
-
-        canvas.save()
-        // Tilt tool naturally for pleasant tactile perspective
-        val toolAngle = -22f
-        canvas.rotate(toolAngle, x, y)
-
-        val sprite = when (tool) {
-            ToolType.NAIL_GRINDER -> SpriteManager.toolGrinder
-            ToolType.WET_WIPE -> SpriteManager.toolWipes
-            ToolType.TWEEZERS -> SpriteManager.toolTweezers
-            ToolType.CREAM_TUBE -> SpriteManager.toolCream
-        }
-
-        if (sprite != null) {
-            val toolW = maxOf(footBounds.width() * 0.26f, 150f)
-            val toolH = toolW * (sprite.height.toFloat() / sprite.width.toFloat())
-            val destRect = RectF(
-                x - toolW * 0.45f,
-                y - toolH * 0.85f,
-                x + toolW * 0.55f,
-                y + toolH * 0.15f
-            )
-            val shadowRect = RectF(destRect).apply { offset(10f, 14f) }
-            canvas.drawBitmap(sprite, null, shadowRect, toolShadowPaint)
-            canvas.drawBitmap(sprite, null, destRect, null)
-        } else {
-            when (tool) {
-                ToolType.WET_WIPE -> drawWetWipeTool(canvas, x, y)
-                ToolType.TWEEZERS -> drawTweezersTool(canvas, x, y)
-                ToolType.NAIL_GRINDER -> drawNailGrinderTool(canvas, x, y)
-                ToolType.CREAM_TUBE -> drawCreamTubeTool(canvas, x, y)
-            }
-        }
-
-        canvas.restore()
-    }
-
-    private fun drawWetWipeTool(canvas: Canvas, x: Float, y: Float) {
-        // Soft drop shadow
-        canvas.drawOval(x - 45f, y - 35f, x + 45f, y + 45f, toolShadowPaint)
-
-        // Folded textured wet wipe cloth
-        val clothPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            shader = LinearGradient(
-                x - 50f, y - 50f, x + 50f, y + 50f,
-                Color.parseColor("#E1F5FE"),
-                Color.parseColor("#B3E5FC"),
-                Shader.TileMode.CLAMP
-            )
-        }
-        val clothRect = RectF(x - 50f, y - 50f, x + 50f, y + 50f)
-        canvas.drawRoundRect(clothRect, 22f, 22f, clothPaint)
-
-        // Folds / creases
-        val foldPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            style = Paint.Style.STROKE
-            strokeWidth = 3f
-            color = Color.parseColor("#81D4FA")
-        }
-        canvas.drawArc(RectF(x - 40f, y - 40f, x + 40f, y + 20f), 20f, 140f, false, foldPaint)
-        canvas.drawArc(RectF(x - 30f, y - 10f, x + 30f, y + 40f), 10f, 120f, false, foldPaint)
-
-        // Water droplet icon in center
-        val dropPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            style = Paint.Style.FILL
-            color = Color.parseColor("#0288D1")
-        }
-        val dropPath = Path().apply {
-            moveTo(x, y - 16f)
-            cubicTo(x + 10f, y - 4f, x + 10f, y + 10f, x, y + 10f)
-            cubicTo(x - 10f, y + 10f, x - 10f, y - 4f, x, y - 16f)
-            close()
-        }
-        canvas.drawPath(dropPath, dropPaint)
-    }
-
-    private fun drawTweezersTool(canvas: Canvas, x: Float, y: Float) {
-        val isPinching = activeSplinter != null
-        val pinchSpread = if (isPinching) 3f else 12f
-
-        // Metal body
-        val metalPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            shader = LinearGradient(
-                x - 20f, y - 120f, x + 20f, y,
-                Color.parseColor("#ECEFF1"),
-                Color.parseColor("#B0BEC5"),
-                Shader.TileMode.CLAMP
-            )
-            style = Paint.Style.FILL
-        }
-        val tipPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.parseColor("#78909C")
-            style = Paint.Style.STROKE
-            strokeWidth = 4f
-            strokeCap = Paint.Cap.ROUND
-        }
-
-        // Left Arm
-        val leftArm = Path().apply {
-            moveTo(x - 14f, y - 130f)
-            lineTo(x - 18f, y - 60f)
-            lineTo(x - pinchSpread, y)
-            lineTo(x - pinchSpread - 4f, y)
-            lineTo(x - 20f, y - 60f)
-            lineTo(x - 16f, y - 130f)
-            close()
-        }
-        // Right Arm
-        val rightArm = Path().apply {
-            moveTo(x + 14f, y - 130f)
-            lineTo(x + 18f, y - 60f)
-            lineTo(x + pinchSpread, y)
-            lineTo(x + pinchSpread + 4f, y)
-            lineTo(x + 20f, y - 60f)
-            lineTo(x + 16f, y - 130f)
-            close()
-        }
-
-        canvas.drawPath(leftArm, metalPaint)
-        canvas.drawPath(rightArm, metalPaint)
-        canvas.drawLine(x - pinchSpread, y, x - pinchSpread, y + 5f, tipPaint)
-        canvas.drawLine(x + pinchSpread, y, x + pinchSpread, y + 5f, tipPaint)
-
-        // Gripping ribs on handle
-        val ribPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            style = Paint.Style.STROKE
-            strokeWidth = 2f
-            color = Color.parseColor("#78909C")
-        }
-        for (k in 0..4) {
-            val ry = y - 85f + k * 8f
-            canvas.drawLine(x - 17f, ry, x - 13f, ry, ribPaint)
-            canvas.drawLine(x + 13f, ry, x + 17f, ry, ribPaint)
-        }
-    }
-
-    private fun drawNailGrinderTool(canvas: Canvas, x: Float, y: Float) {
-        // Drop shadow
-        canvas.drawRect(x - 16f, y - 140f, x + 16f, y, toolShadowPaint)
-
-        // Handheld Body (Teal / Mint ergonomic handle)
-        val handlePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            shader = LinearGradient(
-                x - 22f, y - 150f, x + 22f, y - 40f,
-                Color.parseColor("#80CBC4"),
-                Color.parseColor("#00897B"),
-                Shader.TileMode.CLAMP
-            )
-        }
-        val handleRect = RectF(x - 20f, y - 150f, x + 20f, y - 35f)
-        canvas.drawRoundRect(handleRect, 16f, 16f, handlePaint)
-
-        // Power LED / Button
-        val ledPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.parseColor("#69F0AE")
-        }
-        canvas.drawCircle(x, y - 80f, 5f, ledPaint)
-
-        // Metal Chuck / Collar
-        val chuckPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.parseColor("#CFD8DC")
-        }
-        canvas.drawRect(x - 11f, y - 35f, x + 11f, y - 18f, chuckPaint)
-
-        // Chrome Rotary Shaft
-        val shaftPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.parseColor("#90A4AE")
-            strokeWidth = 5f
-        }
-        canvas.drawLine(x, y - 18f, x, y - 5f, shaftPaint)
-
-        // Grinding abrasive diamond head (textured spinning bit)
-        canvas.save()
-        canvas.translate(x, y)
-        canvas.rotate(grinderRotation)
-
-        val bitPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            shader = RadialGradient(
-                0f, 0f, 14f,
-                Color.parseColor("#F48FB1"),
-                Color.parseColor("#C2185B"),
-                Shader.TileMode.CLAMP
-            )
-        }
-        canvas.drawOval(-10f, -14f, 10f, 14f, bitPaint)
-
-        // Spin texture notches
-        val notchPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            style = Paint.Style.STROKE
-            strokeWidth = 2f
-            color = Color.parseColor("#880E4F")
-        }
-        canvas.drawLine(-8f, 0f, 8f, 0f, notchPaint)
-        canvas.drawLine(0f, -10f, 0f, 10f, notchPaint)
-
-        canvas.restore()
-    }
-
-    private fun drawCreamTubeTool(canvas: Canvas, x: Float, y: Float) {
-        // Drop shadow
-        canvas.drawOval(x - 25f, y - 140f, x + 25f, y + 10f, toolShadowPaint)
-
-        // Vibrant Orange Lotion Tube Body matching the sprite sheet
-        val tubePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            shader = LinearGradient(
-                x - 26f, y - 145f, x + 26f, y - 25f,
-                Color.parseColor("#FFA726"),
-                Color.parseColor("#E65100"),
-                Shader.TileMode.CLAMP
-            )
-        }
-        val tubePath = Path().apply {
-            moveTo(x - 26f, y - 145f)
-            lineTo(x + 26f, y - 145f)
-            lineTo(x + 20f, y - 40f)
-            lineTo(x + 10f, y - 24f)
-            lineTo(x - 10f, y - 24f)
-            lineTo(x - 20f, y - 40f)
-            close()
-        }
-        canvas.drawPath(tubePath, tubePaint)
-
-        // White star on orange tube
-        val starPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.WHITE
-            style = Paint.Style.FILL
-        }
-        drawStar(canvas, x, y - 82f, 15f, 0f, starPaint)
-
-        // Orange crimp at bottom
-        val crimpPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.parseColor("#BF360C")
-            strokeWidth = 4f
-        }
-        canvas.drawLine(x - 27f, y - 145f, x + 27f, y - 145f, crimpPaint)
-
-        // Orange screw cap / nozzle
-        val nozzlePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.parseColor("#E65100")
-        }
-        canvas.drawRect(x - 6f, y - 24f, x + 6f, y - 10f, nozzlePaint)
-
-        // Glowing orange soothing gel dollop at tip
-        val dollopPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.parseColor("#FFCC80")
-        }
-        canvas.drawCircle(x, y - 4f, 8f, dollopPaint)
-        canvas.drawCircle(x + 3f, y - 2f, 5f, dollopPaint)
-    }
-
-    // --- Touch Interaction & Core Layer Mechanics ---
+    // --- Touch Interaction ---
 
     @SuppressLint("ClickableViewAccessibility")
     override fun onTouchEvent(event: MotionEvent): Boolean {
         touchX = event.x
         touchY = event.y
 
-        val cx = footBounds.centerX()
-        val cy = footBounds.centerY()
-        // Map screen touch to the 180-degree rotated foot coordinates
-        val footX = 2f * cx - touchX
-        val footY = 2f * cy - touchY
-        val prevFootX = 2f * cx - lastTouchX
-        val prevFootY = 2f * cy - lastTouchY
-
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
                 isTouching = true
                 lastTouchX = touchX
                 lastTouchY = touchY
-                handleTouchDown(footX, footY, touchX, touchY)
+                handleTouchDown(touchX, touchY)
                 invalidate()
                 return true
             }
             MotionEvent.ACTION_MOVE -> {
                 isTouching = true
-                handleTouchMove(prevFootX, prevFootY, footX, footY, touchX, touchY)
+                handleTouchMove(lastTouchX, lastTouchY, touchX, touchY)
                 lastTouchX = touchX
                 lastTouchY = touchY
                 invalidate()
@@ -1174,12 +816,9 @@ class MakeoverView @JvmOverloads constructor(
         return super.onTouchEvent(event)
     }
 
-    private fun handleTouchDown(footX: Float, footY: Float, screenX: Float, screenY: Float) {
-        if (isHintActive) {
-            dismissHint()
-        }
+    private fun handleTouchDown(x: Float, y: Float) {
+        if (isHintActive) dismissHint()
 
-        // Peel-off interaction when mask is dry
         if (maskState == MaskState.PEELABLE && currentStep == GameStep.APPLY_CREAM) {
             soundManager.playPeelSound()
             soundManager.vibrateTick(60)
@@ -1188,51 +827,37 @@ class MakeoverView @JvmOverloads constructor(
 
         when (activeTool) {
             ToolType.TWEEZERS -> {
-                // Check if touching near an unremoved splinter in foot coordinates
                 activeSplinter = splinters.firstOrNull { splinter ->
-                    !splinter.isRemoved && hypot(footX - splinter.x, footY - splinter.y) < 65f
+                    !splinter.isRemoved && hypot(x - splinter.x, y - splinter.y) < 65f
                 }
                 activeSplinter?.let {
                     it.isPinching = true
                     soundManager.vibrateTick(100)
                 }
             }
-            ToolType.WET_WIPE -> {
-                eraseDirtAt(footX, footY, footX, footY, screenX, screenY)
-            }
-            ToolType.CREAM_TUBE -> {
-                applyCreamAt(footX, footY, footX, footY)
-            }
-            ToolType.NAIL_GRINDER -> {
-                grindNailAt(footX, footY, screenX, screenY)
-            }
-            null -> {
-                // Bare finger touch
-            }
+            ToolType.WET_WIPE -> eraseDirtAt(x, y, x, y)
+            ToolType.CREAM_TUBE -> applyCreamAt(x, y, x, y)
+            ToolType.NAIL_GRINDER -> grindNailAt(x, y)
+            null -> {}
         }
     }
 
-    private fun handleTouchMove(
-        prevFootX: Float, prevFootY: Float,
-        currFootX: Float, currFootY: Float,
-        screenX: Float, screenY: Float
-    ) {
-        // Drag-up peeling interaction
+    private fun handleTouchMove(prevX: Float, prevY: Float, currX: Float, currY: Float) {
         if (maskState == MaskState.PEELABLE && currentStep == GameStep.APPLY_CREAM) {
-            val dragUp = lastTouchY - screenY
-            if (dragUp > 0f) {
-                val delta = dragUp / (footBounds.height() * 0.75f)
-                maskPeelProgress = (maskPeelProgress + delta).coerceIn(0f, 1f)
+            val dragDist = lastTouchY - currY
+            val anyDrag = hypot(currX - prevX, currY - prevY)
+            val progressDelta = if (dragDist > 0f) dragDist / (footBounds.height() * 0.65f) else anyDrag / (footBounds.height() * 1.4f)
+            if (progressDelta > 0f) {
+                maskPeelProgress = (maskPeelProgress + progressDelta).coerceIn(0f, 1f)
                 onStepProgressChanged?.invoke(GameStep.APPLY_CREAM, 0.7f + maskPeelProgress * 0.3f)
-
                 soundManager.playPeelSound()
                 soundManager.vibrateTick(45)
 
                 if (Random.nextFloat() < 0.45f) {
-                    spawnSparkles(screenX, screenY, 3, Color.parseColor("#FFE082"))
+                    spawnSparkles(currX, currY, 2, Color.parseColor("#FFE082"))
                 }
 
-                if (maskPeelProgress >= 0.85f && maskState == MaskState.PEELABLE) {
+                if (maskPeelProgress >= 0.88f && maskState == MaskState.PEELABLE) {
                     maskState = MaskState.PEELED
                     absorbCreamIntoSparkles()
                 }
@@ -1241,39 +866,26 @@ class MakeoverView @JvmOverloads constructor(
         }
 
         when (activeTool) {
-            ToolType.WET_WIPE -> {
-                eraseDirtAt(prevFootX, prevFootY, currFootX, currFootY, screenX, screenY)
-            }
+            ToolType.WET_WIPE -> eraseDirtAt(prevX, prevY, currX, currY)
             ToolType.TWEEZERS -> {
                 activeSplinter?.let { splinter ->
-                    val dist = hypot(currFootX - splinter.x, currFootY - splinter.y)
+                    val dist = hypot(currX - splinter.x, currY - splinter.y)
                     splinter.pullDistance = dist
-
                     soundManager.vibrateTick(60)
-
-                    if (dist > 40f && !splinter.isRemoved) {
+                    if (dist > 45f && !splinter.isRemoved) {
                         splinter.isRemoved = true
                         activeSplinter = null
                         soundManager.playPluckSound()
                         soundManager.vibratePop()
-
-                        // Burst of healing green/gold sparkles on screen
-                        spawnSparkles(screenX, screenY, 20, Color.parseColor("#81C784"))
-                        spawnSparkles(screenX, screenY, 10, Color.parseColor("#FFD54F"))
-
+                        spawnSparkles(currX, currY, 14, Color.parseColor("#81C784"))
+                        spawnSparkles(currX, currY, 8, Color.parseColor("#FFD54F"))
                         checkSplintersCompletion()
                     }
                 }
             }
-            ToolType.NAIL_GRINDER -> {
-                grindNailAt(currFootX, currFootY, screenX, screenY)
-            }
-            ToolType.CREAM_TUBE -> {
-                applyCreamAt(prevFootX, prevFootY, currFootX, currFootY)
-            }
-            null -> {
-                // Bare finger drag
-            }
+            ToolType.NAIL_GRINDER -> grindNailAt(currX, currY)
+            ToolType.CREAM_TUBE -> applyCreamAt(prevX, prevY, currX, currY)
+            null -> {}
         }
     }
 
@@ -1285,13 +897,9 @@ class MakeoverView @JvmOverloads constructor(
         }
     }
 
-    // --- Step 1: Dirt Erasing (PorterDuff.Mode.CLEAR) ---
+    // --- Step 1: Wipe off mud ---
 
-    private fun eraseDirtAt(
-        x0: Float, y0: Float,
-        x1: Float, y1: Float,
-        screenX: Float, screenY: Float
-    ) {
+    private fun eraseDirtAt(x0: Float, y0: Float, x1: Float, y1: Float) {
         dirtCanvas?.let { cvs ->
             cvs.drawLine(x0, y0, x1, y1, erasePaint)
             cvs.drawCircle(x1, y1, erasePaint.strokeWidth * 0.5f, erasePaint)
@@ -1299,12 +907,12 @@ class MakeoverView @JvmOverloads constructor(
             if (Random.nextFloat() < 0.45f) {
                 particles.add(
                     Particle(
-                        x = screenX + (Random.nextFloat() - 0.5f) * 40f,
-                        y = screenY + (Random.nextFloat() - 0.5f) * 40f,
+                        x = x1 + (Random.nextFloat() - 0.5f) * 36f,
+                        y = y1 + (Random.nextFloat() - 0.5f) * 36f,
                         vx = (Random.nextFloat() - 0.5f) * 2f,
                         vy = -Random.nextFloat() * 1.5f,
                         size = 5f + Random.nextFloat() * 8f,
-                        color = Color.argb(160, 225, 245, 254),
+                        color = Color.argb(165, 225, 245, 254),
                         type = ParticleType.MOISTURE,
                         decay = 0.05f
                     )
@@ -1312,28 +920,28 @@ class MakeoverView @JvmOverloads constructor(
             }
 
             soundManager.playWipeSound()
-            soundManager.vibrateTick(50)
-
+            soundManager.vibrateTick(45)
             calculateDirtCleaned(x1, y1)
         }
     }
 
-    private fun calculateDirtCleaned(footTouchX: Float, footTouchY: Float) {
-        val eraseRadius = erasePaint.strokeWidth * 0.55f
+    private fun calculateDirtCleaned(x: Float, y: Float) {
+        val eraseRadius = erasePaint.strokeWidth * 0.58f
+        for (spot in mudSpots) {
+            if (spot.cleanProgress < 1f && hypot(x - spot.x, y - spot.y) <= spot.radius + eraseRadius * 0.4f) {
+                spot.cleanProgress = 1f
+            }
+        }
         for ((idx, pt) in dirtSamplePoints.withIndex()) {
-            if (!cleanedSampleIndices.contains(idx)) {
-                if (hypot(footTouchX - pt.x, footTouchY - pt.y) <= eraseRadius) {
-                    cleanedSampleIndices.add(idx)
-                }
+            if (!cleanedSampleIndices.contains(idx) && hypot(x - pt.x, y - pt.y) <= eraseRadius) {
+                cleanedSampleIndices.add(idx)
             }
         }
 
         val total = dirtSamplePoints.size.toFloat().coerceAtLeast(1f)
-        val cleanedPercent = (cleanedSampleIndices.size / total)
-
+        val cleanedPercent = cleanedSampleIndices.size / total
         onStepProgressChanged?.invoke(GameStep.CLEAN_DIRT, cleanedPercent)
 
-        // When >85% cleaned, smoothly fade out remaining dirt and advance
         if (cleanedPercent >= 0.85f && dirtFadeAlpha == 1f && currentStep == GameStep.CLEAN_DIRT) {
             triggerDirtFadeOut()
         }
@@ -1342,22 +950,21 @@ class MakeoverView @JvmOverloads constructor(
     private fun triggerDirtFadeOut() {
         soundManager.playChime()
         soundManager.vibrateSuccess()
-        spawnSparkles(footBounds.centerX(), footBounds.centerY(), 35, Color.parseColor("#4FC3F7"))
+        spawnSparkles(footBounds.centerX(), footBounds.centerY(), 25, Color.parseColor("#4FC3F7"))
 
-        val animator = ValueAnimator.ofFloat(1f, 0f).apply {
+        ValueAnimator.ofFloat(1f, 0f).apply {
             duration = 550
             interpolator = AccelerateDecelerateInterpolator()
             addUpdateListener { va ->
                 dirtFadeAlpha = va.animatedValue as Float
                 invalidate()
             }
-        }
-        animator.start()
+        }.start()
 
         advanceStep(GameStep.PLUCK_SPLINTERS)
     }
 
-    // --- Step 2: Splinters Completion ---
+    // --- Step 2: Splinters ---
 
     private fun checkSplintersCompletion() {
         val remaining = splinters.count { !it.isRemoved }
@@ -1367,30 +974,28 @@ class MakeoverView @JvmOverloads constructor(
         if (remaining == 0 && currentStep == GameStep.PLUCK_SPLINTERS) {
             soundManager.playChime()
             soundManager.vibrateSuccess()
-            spawnSparkles(footBounds.centerX(), footBounds.centerY(), 40, Color.parseColor("#81C784"))
+            spawnSparkles(footBounds.centerX(), footBounds.centerY(), 30, Color.parseColor("#81C784"))
             advanceStep(GameStep.TRIM_NAILS)
         }
     }
 
     // --- Step 3: Nail Grinding ---
 
-    private fun grindNailAt(footX: Float, footY: Float, screenX: Float, screenY: Float) {
+    private fun grindNailAt(x: Float, y: Float) {
         for (nail in nails) {
             if (nail.trimProgress >= 1f) continue
 
-            val nailCenterY = nail.y - nail.radiusY * 0.30f
-            val dist = hypot(footX - nail.x, footY - nailCenterY)
-            if (dist < nail.radiusX * 1.6f + 25f) {
-                nail.trimProgress = (nail.trimProgress + 0.035f).coerceAtMost(1f)
-
+            val hitRadius = maxOf(nail.radiusX, nail.radiusY) * 1.45f + 24f
+            if (hypot(x - nail.x, y - nail.y) <= hitRadius) {
+                nail.trimProgress = (nail.trimProgress + 0.042f).coerceAtMost(1f)
                 soundManager.playGrindSound()
                 soundManager.vibrateGrind()
 
                 for (k in 0..2) {
                     particles.add(
                         Particle(
-                            x = screenX + (Random.nextFloat() - 0.5f) * 10f,
-                            y = screenY + (Random.nextFloat() - 0.5f) * 10f,
+                            x = x + (Random.nextFloat() - 0.5f) * 12f,
+                            y = y + (Random.nextFloat() - 0.5f) * 12f,
                             vx = (Random.nextFloat() - 0.5f) * 7f,
                             vy = (Random.nextFloat() - 0.8f) * 6f,
                             size = 3f + Random.nextFloat() * 4f,
@@ -1403,7 +1008,7 @@ class MakeoverView @JvmOverloads constructor(
 
                 if (nail.trimProgress >= 1f) {
                     soundManager.playChime()
-                    spawnSparkles(screenX, screenY, 16, Color.parseColor("#FF80AB"))
+                    spawnSparkles(nail.x, nail.y, 12, Color.parseColor("#FFD54F"))
                 }
 
                 checkNailsCompletion()
@@ -1419,40 +1024,29 @@ class MakeoverView @JvmOverloads constructor(
         if (nails.all { it.trimProgress >= 1f } && currentStep == GameStep.TRIM_NAILS) {
             soundManager.playChime()
             soundManager.vibrateSuccess()
-            val cx = footBounds.centerX()
-            val cy = footBounds.centerY()
-            // Toes are at the bottom on screen
-            spawnSparkles(cx, cy + footBounds.height() * 0.4f, 50, Color.parseColor("#FFD54F"))
+            spawnSparkles(footBounds.centerX(), footBounds.bottom - footBounds.height() * 0.1f, 32, Color.parseColor("#FFD54F"))
             advanceStep(GameStep.APPLY_CREAM)
         }
     }
 
-    // --- Step 4: Cream / Peel-off Mask Layer ---
+    // --- Step 4: Cream & Stationary Peel-Off ---
 
-    private fun applyCreamAt(
-        x0: Float, y0: Float,
-        x1: Float, y1: Float
-    ) {
+    private fun applyCreamAt(x0: Float, y0: Float, x1: Float, y1: Float) {
         if (maskState != MaskState.APPLYING) return
 
         creamCanvas?.let { cvs ->
             cvs.drawLine(x0, y0, x1, y1, creamDepositPaint)
             cvs.drawCircle(x1, y1, creamDepositPaint.strokeWidth * 0.5f, creamDepositPaint)
-
-            // Glossy warm center stroke
             cvs.drawLine(x0, y0, x1, y1, creamHighlightPaint)
             cvs.drawCircle(x1, y1, creamHighlightPaint.strokeWidth * 0.5f, creamHighlightPaint)
 
             soundManager.playCreamSound()
             soundManager.vibrateTick(45)
 
-            // Calculate coverage
-            val applyRadius = creamDepositPaint.strokeWidth * 0.5f
+            val applyRadius = creamDepositPaint.strokeWidth * 0.55f
             for ((idx, pt) in creamSamplePoints.withIndex()) {
-                if (!coveredCreamIndices.contains(idx)) {
-                    if (hypot(x1 - pt.x, y1 - pt.y) <= applyRadius) {
-                        coveredCreamIndices.add(idx)
-                    }
+                if (!coveredCreamIndices.contains(idx) && hypot(x1 - pt.x, y1 - pt.y) <= applyRadius) {
+                    coveredCreamIndices.add(idx)
                 }
             }
 
@@ -1460,7 +1054,6 @@ class MakeoverView @JvmOverloads constructor(
             val coverage = coveredCreamIndices.size / total
             onStepProgressChanged?.invoke(GameStep.APPLY_CREAM, coverage * 0.65f)
 
-            // When >80% applied, trigger drying animation
             if (coverage >= 0.80f && maskState == MaskState.APPLYING && currentStep == GameStep.APPLY_CREAM) {
                 startMaskDrying()
             }
@@ -1472,23 +1065,21 @@ class MakeoverView @JvmOverloads constructor(
         soundManager.playChime()
         soundManager.vibrateTick(120)
 
-        // 1.8-second drying animation during which color visibly changes from wet gold to dried amber-bronze
-        val animator = ValueAnimator.ofFloat(0f, 1f).apply {
-            duration = 1800
+        ValueAnimator.ofFloat(0f, 1f).apply {
+            duration = 1600
             interpolator = AccelerateDecelerateInterpolator()
             addUpdateListener { va ->
                 maskDryProgress = va.animatedValue as Float
-                if (Random.nextFloat() < 0.45f) {
+                if (Random.nextFloat() < 0.4f) {
                     val rx = footBounds.left + Random.nextFloat() * footBounds.width()
                     val ry = footBounds.top + Random.nextFloat() * footBounds.height()
-                    spawnSparkles(rx, ry, 2, Color.parseColor("#FFE082"))
+                    spawnSparkles(rx, ry, 1, Color.parseColor("#FFE082"))
                 }
                 invalidate()
             }
             addListener(object : android.animation.AnimatorListenerAdapter() {
                 override fun onAnimationEnd(animation: android.animation.Animator) {
                     maskState = MaskState.PEELABLE
-                    // Deselect the tube so user's bare hand is ready to peel
                     selectTool(null)
                     onToolDeselectRequested?.invoke()
                     soundManager.playChime()
@@ -1497,40 +1088,28 @@ class MakeoverView @JvmOverloads constructor(
                     invalidate()
                 }
             })
-        }
-        animator.start()
+        }.start()
     }
 
     private fun absorbCreamIntoSparkles() {
-        creamAbsorbed = true
         isFinishing = true
         soundManager.playVictory()
         soundManager.vibrateSuccess()
 
-        val cx = footBounds.centerX()
-        val cy = footBounds.centerY()
-
-        // 1. Confetti celebration
         spawnConfetti()
-
-        // 2. Star sparkles burst on every newly restored toe
         for (nail in nails) {
-            val screenNailX = 2f * cx - nail.x
-            val screenNailY = 2f * cy - (nail.y - nail.radiusY * 0.30f)
-            spawnSparkles(screenNailX, screenNailY, 16, Color.parseColor("#FFD700"))
+            spawnSparkles(nail.x, nail.y, 10, Color.parseColor("#FFD700"))
         }
 
-        // 3. Shockwave glow rings and radiant finish animation over 2 seconds
-        val animator = ValueAnimator.ofFloat(0f, 1f).apply {
-            duration = 2000
+        ValueAnimator.ofFloat(0f, 1f).apply {
+            duration = 1800
             interpolator = AccelerateDecelerateInterpolator()
             addUpdateListener { va ->
                 finishAnimProgress = va.animatedValue as Float
-                creamFadeAlpha = 1f - finishAnimProgress.coerceIn(0f, 1f)
-                if (Random.nextFloat() < 0.75f) {
+                if (Random.nextFloat() < 0.7f) {
                     val rx = footBounds.left + Random.nextFloat() * footBounds.width()
                     val ry = footBounds.top + Random.nextFloat() * footBounds.height()
-                    spawnSparkles(rx, ry, 4, Color.parseColor("#FFF9C4"))
+                    spawnSparkles(rx, ry, 3, Color.parseColor("#FFF9C4"))
                 }
                 invalidate()
             }
@@ -1540,8 +1119,7 @@ class MakeoverView @JvmOverloads constructor(
                     onLevelCompletedListener?.invoke()
                 }
             })
-        }
-        animator.start()
+        }.start()
     }
 
     // --- Particle Spawners ---
@@ -1556,7 +1134,7 @@ class MakeoverView @JvmOverloads constructor(
                     y = cy,
                     vx = cos(ang) * spd,
                     vy = sin(ang) * spd,
-                    size = 10f + Random.nextFloat() * 14f,
+                    size = 10f + Random.nextFloat() * 12f,
                     color = color,
                     type = ParticleType.SPARKLE,
                     rotation = Random.nextFloat() * 360f,
@@ -1576,11 +1154,11 @@ class MakeoverView @JvmOverloads constructor(
             Color.parseColor("#FFD700"),
             Color.parseColor("#FF6D00")
         )
-        for (i in 0 until 80) {
+        for (i in 0 until 75) {
             particles.add(
                 Particle(
                     x = footBounds.left + Random.nextFloat() * footBounds.width(),
-                    y = footBounds.top - 50f + Random.nextFloat() * 150f,
+                    y = footBounds.top - 40f + Random.nextFloat() * 140f,
                     vx = (Random.nextFloat() - 0.5f) * 10f,
                     vy = -2f - Random.nextFloat() * 8f,
                     size = 12f + Random.nextFloat() * 10f,
@@ -1600,7 +1178,6 @@ class MakeoverView @JvmOverloads constructor(
         val prev = currentStep
         currentStep = next
         onStepCompletedListener?.invoke(prev)
-        // Automatically switch recommended tool for next step
         activeTool = next.recommendedTool
     }
 
@@ -1646,9 +1223,8 @@ class MakeoverView @JvmOverloads constructor(
         finishAnimProgress = 0f
         isFinishing = false
 
-        for (nail in nails) {
-            nail.trimProgress = 0f
-        }
+        for (spot in mudSpots) spot.cleanProgress = 0f
+        for (nail in nails) nail.trimProgress = 0f
         for (splinter in splinters) {
             splinter.isRemoved = false
             splinter.pullDistance = 0f
